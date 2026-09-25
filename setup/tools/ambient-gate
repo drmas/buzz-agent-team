@@ -1,0 +1,167 @@
+#!/usr/bin/env node
+// ambient-gate — cheap pre-check for "ambient" events: human messages in a channel an agent listens
+// to, where nobody mentioned the agent. Most of them don't need a reply, but each one would otherwise
+// cost a full turn on the agent's main model just to decide to stay silent. A fast model decides
+// first; only messages that plausibly need this agent get through.
+//
+//   ambient-gate --hook                            # Claude Code UserPromptSubmit hook (prompt JSON on stdin)
+//   ambient-gate --channel <uuid> --event <id>     # manual form (Codex agents run it themselves)
+//
+// Hook form: prints nothing (let the turn run) or {"decision":"block",...} (end the turn before the
+// model sees it: zero tokens, no reply). Only prompts whose events are *all* ambient are checked;
+// mentions, DMs, check-ins and interactive sessions always pass.
+// Manual form: prints `REPLY: <reason>` or `SKIP: <reason>`.
+//
+// Classifier (AMBIENT_GATE, default auto): `jev` = TypeSafe's Jev (needs TYPESAFE_API_KEY), `haiku` =
+// `claude -p --model haiku` on the agent's Claude subscription, `off` = always let through.
+// auto = jev if the key is set, else haiku on Claude agents, else off. Fails open: any error lets
+// the message through, so the agent's own "When you are not mentioned" rule still applies.
+//
+// Env: AGENT_PUBKEY (this agent), AMBIENT_GATE_MIN (Jev probability below which the message is
+// skipped, default 0.3: only clear "not for me" messages are dropped), AMBIENT_GATE_TIMEOUT (s, 25).
+'use strict';
+const { execFileSync } = require('child_process');
+const fs = require('fs');
+
+const API = process.env.TYPESAFE_API_URL || 'https://api.typesafe.ai/v1/systemone';
+const MODEL = process.env.TYPESAFE_MODEL || 'jev-latest';
+const ROSTER = process.env.TURN_GATE_ROSTER || '/prompts/_roster.md';
+const LOG = `${process.env.HOME || '/tmp'}/.ambient-gate.log`;
+const MIN = +(process.env.AMBIENT_GATE_MIN || 0.3);
+const TIMEOUT = +(process.env.AMBIENT_GATE_TIMEOUT || 25);
+const MAX_CONTEXT = 4000, MAX_MSG = 2000;
+
+const args = process.argv.slice(2);
+const arg = (n) => { const i = args.indexOf(`--${n}`); return i >= 0 ? args[i + 1] : undefined; };
+const HOOK = args.includes('--hook');
+
+function log(entry) {
+  try { fs.appendFileSync(LOG, JSON.stringify({ t: new Date().toISOString(), ...entry }) + '\n'); } catch {}
+}
+
+// Let the message through. Hook: silent exit 0. Manual: REPLY line.
+function pass(reason, extra = {}, quiet = false) {
+  if (!quiet) log({ decision: 'REPLY', reason, ...extra });
+  if (!HOOK) console.log(`REPLY: ${reason}`);
+  process.exit(0);
+}
+
+function skip(reason, extra = {}) {
+  log({ decision: 'SKIP', reason, ...extra });
+  if (HOOK) console.log(JSON.stringify({ decision: 'block', reason: `ambient-gate: ${reason}` }));
+  else console.log(`SKIP: ${reason}. Send nothing`);
+  process.exit(0);
+}
+
+// This agent's roster row (name + area): | Name | `pubkey` | Runtime | Responds to | Listens | About |
+function self() {
+  const me = process.env.AGENT_PUBKEY;
+  for (const line of fs.readFileSync(ROSTER, 'utf8').split('\n')) {
+    const m = line.match(/^\| (.+?) \| `([0-9a-f]{64})` \| .+? \| .+? \| .+? \| (.*) \|$/);
+    if (m && m[2] === me) return { name: m[1], area: m[3] };
+  }
+  return null;
+}
+
+// Hook form: pull the event tags, triggering message(s) and thread context out of the prompt that
+// buzz-acp built ("[Buzz event: <rule>]" or "--- Event N (<rule>) ---" + "From:/Content:/Tags:").
+function fromPrompt(prompt) {
+  const tags = [...prompt.matchAll(/^\[Buzz event: (.+)\]$|^--- Event \d+ \((.+)\) ---$/gm)].map((m) => m[1] || m[2]);
+  const messages = [...prompt.matchAll(/^From: (.*)\nTime: .*\nContent: ([\s\S]*?)\nTags: /gm)]
+    .map((m) => ({ from: m[1].replace(/ \(npub: .*$| \(npub1.*$/, ''), text: m[2].slice(0, MAX_MSG) }));
+  const ctx = prompt.match(/^\[(?:Thread|Conversation) Context \(.*\)\]$([\s\S]*?)(?=^\[Buzz event|^--- Event |\n\[[A-Z][^\]\n]*\]\n)/m);
+  const channel = (prompt.match(/^Channel: (.+?) \(#/m) || [])[1];
+  return { tags, messages, context: ctx ? ctx[1].trim().slice(-MAX_CONTEXT) : '', channel };
+}
+
+// Manual form: read the thread from the relay.
+function fromRelay(channel, event) {
+  const out = execFileSync('buzz', ['messages', 'thread', '--channel', channel, '--event', event, '--limit', '30'],
+    { encoding: 'utf8', timeout: 30000, stdio: ['ignore', 'pipe', 'pipe'] });
+  const events = JSON.parse(out).filter((e) => e.kind === 9).sort((a, b) => a.created_at - b.created_at);
+  const idx = events.findIndex((e) => e.id === event);
+  if (idx < 0) return null;
+  const line = (e) => `${e.pubkey.slice(0, 8)}: ${e.content.slice(0, 500)}`;
+  return {
+    tags: ['ambient'],
+    messages: [{ from: events[idx].pubkey.slice(0, 8), text: events[idx].content.slice(0, MAX_MSG) }],
+    context: events.slice(Math.max(0, idx - 12), idx).map(line).join('\n').slice(-MAX_CONTEXT),
+  };
+}
+
+const QUESTION = 'A human posted `message` in a channel that the AI teammate described in `agent` watches, ' +
+  'without mentioning it. Should that agent reply? It should reply only when the message is clearly in its area and ' +
+  'it can add concrete value nobody in `recent_messages` has given yet (answer an open question, capture a decision ' +
+  'or task with an owner, flag a real risk or conflict, offer a specific deliverable), or when the message answers ' +
+  'or asks something of that agent in `recent_messages`.';
+const CRITERIA = {
+  true: 'Clearly in the agent\'s area and a reply from it would add concrete, not-yet-given value, or the message is directed at that agent',
+  false: 'Social chat, thanks, acknowledgements, status chatter, outside the agent\'s area, already handled, or a conversation between humans that doesn\'t need an AI teammate',
+};
+
+async function jev(state) {
+  const res = await fetch(API, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${process.env.TYPESAFE_API_KEY}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ state, model: MODEL, questions: { engage: { type: 'noul', instructions: QUESTION, criteria: CRITERIA } } }),
+    signal: AbortSignal.timeout(TIMEOUT * 1000),
+  });
+  if (!res.ok) throw new Error(`TypeSafe HTTP ${res.status}: ${(await res.text()).slice(0, 200)}`);
+  return (await res.json()).answers.engage.noul;
+}
+
+function haiku(state) {
+  const env = { ...process.env, AMBIENT_GATE_INNER: '1' };
+  delete env.CLAUDE_CODE_EFFORT_LEVEL; delete env.ANTHROPIC_MODEL;
+  const out = execFileSync('claude', ['-p', '--model', 'haiku', '--tools', '', '--setting-sources', '',
+    '--no-session-persistence', '--output-format', 'text',
+    '--system-prompt', `You screen chat messages for an AI teammate. ${QUESTION} Answer with exactly one word: REPLY or SKIP. ` +
+      'REPLY means: ' + CRITERIA.true + '. SKIP means: ' + CRITERIA.false + '. If unsure, answer REPLY.',
+    JSON.stringify(state, null, 1)], { cwd: '/tmp', env, encoding: 'utf8', timeout: TIMEOUT * 1000, stdio: ['ignore', 'pipe', 'pipe'] });
+  return /\bSKIP\b/.test(out) && !/\bREPLY\b/.test(out) ? 'SKIP' : 'REPLY';
+}
+
+async function main() {
+  if (process.env.AMBIENT_GATE_INNER) process.exit(0);   // the haiku call below runs Claude Code too
+  let input, where = {};
+  if (HOOK) {
+    const hook = JSON.parse(fs.readFileSync(0, 'utf8') || '{}');
+    input = fromPrompt(String(hook.prompt || ''));
+    if (!input.tags.length || input.tags.some((t) => t !== 'ambient')) pass('not ambient', {}, true);
+  } else {
+    const channel = arg('channel'), event = arg('event');
+    if (!channel || !/^[0-9a-f]{64}$/.test(event || '')) {
+      console.error('usage: ambient-gate --hook | --channel <uuid> --event <event-id>'); process.exit(1);
+    }
+    where = { channel, event };
+  }
+  let mode = process.env.AMBIENT_GATE || 'auto';
+  if (mode === 'auto') mode = process.env.TYPESAFE_API_KEY ? 'jev' : (HOOK && process.env.CLAUDE_CODE_EXECUTABLE ? 'haiku' : 'off');
+  if (mode === 'off') return pass('gate off', where);
+  if (!HOOK) {
+    input = fromRelay(where.channel, where.event);
+    if (!input) return pass('event not found in thread', where);
+  }
+  if (!input.messages.length) return pass('no message text found', where);
+
+  const agent = self();
+  if (!agent) return pass('gate off (AGENT_PUBKEY not in roster)', where);
+
+  const state = {
+    agent,
+    channel: input.channel,
+    recent_messages: input.context || '(none)',
+    message: input.messages.length === 1 ? input.messages[0] : input.messages,
+  };
+  const t0 = Date.now();
+  if (mode === 'jev') {
+    const p = await jev(state);
+    const extra = { ...where, mode, engage: +p.toFixed(3), ms: Date.now() - t0 };
+    return p < MIN ? skip(`not for ${agent.name} (engage=${p.toFixed(2)})`, extra) : pass(`engage=${p.toFixed(2)}`, extra);
+  }
+  const d = haiku(state);
+  const extra = { ...where, mode, ms: Date.now() - t0 };
+  return d === 'SKIP' ? skip(`not for ${agent.name} (haiku)`, extra) : pass('haiku says reply', extra);
+}
+
+main().catch((e) => pass(`gate error (${String(e.message || e).slice(0, 160)})`));

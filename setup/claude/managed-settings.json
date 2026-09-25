@@ -1,0 +1,7 @@
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      { "hooks": [ { "type": "command", "command": "/opt/agent-tools/ambient-gate --hook", "timeout": 45 } ] }
+    ]
+  }
+}

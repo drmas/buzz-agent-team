@@ -119,7 +119,7 @@ humans) first, then:
 ```
 
 Installs `agentctl`, prompt sources, skills (`update-instructions`, `memory`) and tools (`mem`,
-`mem-mirror`); creates `pm`, `designer`, `marketing` (Claude) and `engineer` (Codex); builds each
+`mem-mirror`); creates `pm`, `designer`, `marketing` and `engineer` (Claude Code); builds each
 agent's instructions with the auto-generated "Who's who" roster; starts everything. It is
 idempotent: re-run it after editing any prompt, skill or tool.
 
@@ -128,17 +128,16 @@ idempotent: re-run it after editing any prompt, skill or tool.
 Get their npubs on the server with `agentctl list` (or `buzz-team list` once step 11 is done). In Buzz Desktop, add each npub as a community member.
 Until an agent is a member it restarts with `not a relay member`; that's expected.
 
-### 6. Sign the Codex agents in to ChatGPT
+### 6. Sign the Codex agent in to ChatGPT
 
 On the server (`buzz-team server`, or SSM + `sudo -i`):
 
 ```bash
 agentctl login-codex codex      # prints a URL + one-time code
-agentctl login-codex engineer
-agentctl restart codex; agentctl restart engineer
+agentctl restart codex
 ```
 
-Open `https://auth.openai.com/codex/device` and enter each code.
+Open `https://auth.openai.com/codex/device` and enter the code.
 
 ### 7. Set profiles
 
@@ -193,7 +192,7 @@ Must be done by hand (Claude Code's safety check refuses to do it). Weigh the ri
 agents take instructions from anyone in the community. As root on the server:
 
 ```bash
-cd /opt/buzz-agents && for a in codex engineer; do docker compose -p buzz-agents exec -T $a sh -c 'f=~/.codex/config.toml; touch $f; sed -i "/^sandbox_mode *=/d;/^approval_policy *=/d" $f; printf "sandbox_mode = \"danger-full-access\"\napproval_policy = \"never\"\n" | cat - $f > $f.new && mv $f.new $f && cat $f'; agentctl restart $a; done
+cd /opt/buzz-agents && for a in codex; do docker compose -p buzz-agents exec -T $a sh -c 'f=~/.codex/config.toml; touch $f; sed -i "/^sandbox_mode *=/d;/^approval_policy *=/d" $f; printf "sandbox_mode = \"danger-full-access\"\napproval_policy = \"never\"\n" | cat - $f > $f.new && mv $f.new $f && cat $f'; agentctl restart $a; done
 ```
 
 Undo: delete those two lines from `~/.codex/config.toml` and restart.
@@ -244,7 +243,7 @@ updates automatically.
   (rule in `prompts/_turns.md`, tool in `tools/turn-gate`). All of them ask TypeSafe's Jev model
   the same question about the same thread snapshot ("who should reply first?", plus "does each
   agent have its own ask?"), so they agree on an order without talking to each other. The first
-  replies; the rest poll the thread (up to 120 s per agent ahead, max 300 s), then ask Jev whether
+  replies; the rest poll the thread (up to 60 s per agent ahead, max 180 s), then ask Jev whether
   anything is left for them: `SKIP`, or `REPLY-AFTER` adding only what's new. Without
   `/buzz/typesafe-api-key`, or on any error, it answers `REPLY` (the old behaviour). Decisions are
   logged to `~/.turn-gate.log` in each agent's home; wait times and thresholds are constants at the
@@ -261,8 +260,30 @@ updates automatically.
 - Built-in memory systems are turned off on purpose (`BUZZ_ACP_NO_MEMORY`,
   `CLAUDE_CODE_DISABLE_AUTO_MEMORY`); file memory is loaded only on demand. Sessions restart every
   40 turns (`BUZZ_ACP_MAX_TURNS_PER_SESSION`) to keep context small.
-- Every human message in a listened-to channel is a model turn on your subscription, even if the
-  agent stays silent. Subscriptions are shared by all agents.
+- **Model and effort per agent:** `agentctl model <id> <model> <effort>` (Claude: `ANTHROPIC_MODEL`
+  + `CLAUDE_CODE_EFFORT_LEVEL`; Codex: `CODEX_CONFIG` JSON, all in `<id>.env`). `deploy-team.sh`
+  sets defaults only where nothing is set: Sonnet at medium for PM, Designer and Marketing, Opus at
+  medium for Claude and Engineer, medium reasoning for Codex (Codex's own default is low).
+  `agentctl runtime <id> claude|codex` switches an agent's runtime in place (identity, memory,
+  workspace and standing instructions stay); `deploy-team.sh` uses it to move an existing Codex
+  `engineer` to Claude Code. The
+  environment variable wins over everything, including `/effort` and subagent frontmatter.
+- **Subagents:** Claude agents get `deep-work` (Opus) and `scout` (Haiku) from `claude/agents/`,
+  mounted read-only at `~/.claude/agents/team/`, plus a prompt section (`prompts/_delegate.md`)
+  saying when to use them. So chat stays on the cheap model and heavy work gets the strong one.
+  Subagents run at the agent's effort level; this Claude Code version ignores `effort:` in
+  subagent frontmatter.
+- **Ambient gate:** every human message in a listened-to channel used to be a full model turn,
+  even when the agent then stayed silent. Now a fast model screens those first (`tools/ambient-gate`):
+  Jev when `/buzz/typesafe-api-key` is set, otherwise Haiku on the Claude subscription. On Claude
+  agents it's a `UserPromptSubmit` hook in `claude/managed-settings.json` (mounted at
+  `/etc/claude-code/managed-settings.json`): a blocked turn ends before the model runs, costs
+  0 tokens, and posts nothing. It only looks at prompts whose events are all `ambient`, so mentions,
+  DMs and check-ins are never touched, and it fails open. Codex agents that listen run it
+  themselves (rule in `prompts/_ambient.md`); their hooks need interactive trust, so the gate isn't
+  a hook there. Decisions are logged to `~/.ambient-gate.log`; tune with `AMBIENT_GATE_MIN`
+  (default 0.3: only clear "not for me" messages are dropped) or turn off with `AMBIENT_GATE=off`.
+- Subscriptions are shared by all agents.
 - `claude setup-token` run from a chat command box leaks the token's tail into the chat; run it in
   a real terminal.
 

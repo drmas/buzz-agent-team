@@ -3,6 +3,9 @@
 #
 #   agentctl list
 #   agentctl add <id> <claude|codex> --name NAME [--about TEXT] [--respond-to MODE] [--mem 2g] [--kind team|solo]
+#                [--model M] [--effort E]
+#   agentctl model <id> [<model|default|-> [effort|default|-]] [--no-restart]   # no args: show; - keeps current
+#   agentctl runtime <id> <claude|codex> [--no-restart]   # switch runtime; keeps identity, memory, workspace, instructions
 #   agentctl profile <id> --name NAME [--about TEXT]
 #   agentctl login-codex <id>          # ChatGPT device login for a codex agent
 #   agentctl restart <id> | logs <id> | remove <id> [--purge]
@@ -15,8 +18,12 @@
 #
 # Registry: agents.list ("<id> <runtime> <mem> <kind>"); <id>.meta = display name / about.
 # Prompt sources: prompts/src/<id>.md (role), _team.md (team agents only), _turns.md, _people.md
-# (humans + company, edit by hand), _instructions.md. Built per agent into prompts/<id>.md
-# (mounted read-only at /prompts) with an auto-generated "Who's who" roster.
+# (humans + company, edit by hand), _instructions.md, _delegate.md (Claude agents), _ambient.md
+# (Codex agents that listen). Built per agent into prompts/<id>.md (mounted read-only at /prompts)
+# with an auto-generated "Who's who" roster.
+# Model and effort live in <id>.env: ANTHROPIC_MODEL + CLAUDE_CODE_EFFORT_LEVEL (Claude) or
+# CODEX_CONFIG={"model":…,"model_reasoning_effort":…} (Codex). Claude agents also get
+# claude/managed-settings.json (ambient-gate hook) and the claude/agents/ subagents, read-only.
 set -euo pipefail
 DIR=/opt/buzz-agents
 cd "$DIR"
@@ -96,7 +103,7 @@ EOF
       echo "    env_file:"
       echo "      - $id.env"
       echo "      - { path: secrets/$rt.env, required: false }"
-      echo "      - { path: secrets/common.env, required: false }   # TYPESAFE_API_KEY (turn-gate)"
+      echo "      - { path: secrets/common.env, required: false }   # TYPESAFE_API_KEY (turn-gate, ambient-gate)"
       echo "    volumes:"
       echo "      - $id-home:/home/agent"
       echo "      - $id-ws:/workspace"
@@ -107,6 +114,10 @@ EOF
         [ -d "$sk" ] || continue; sk=$(basename "$sk")
         echo "      - ./skills/$sk:/home/agent/$cfg/skills/$sk:ro"
       done
+      if [ "$rt" = claude ]; then
+        echo "      - ./claude/managed-settings.json:/etc/claude-code/managed-settings.json:ro   # ambient-gate hook"
+        echo "      - ./claude/agents:/home/agent/.claude/agents/team:ro   # deep-work / scout subagents"
+      fi
       echo "    networks: [$id-net]"
     done < agents.list
     echo; echo "networks:"
@@ -124,9 +135,9 @@ prep_home() {  # id runtime
   if [ "$2" = claude ]; then cfg=.claude; file=CLAUDE.md; else cfg=.codex; file=AGENTS.md; fi
   docker run --rm -v "buzz-agents_$1-home:/h" -v "$DIR/instructions-header.md:/header.md:ro" \
     -e CFG="$cfg" -e FILE="$file" alpine sh -c '
-      mkdir -p "/h/$CFG/skills" /h/instructions-history
+      mkdir -p "/h/$CFG/skills" "/h/$CFG/agents" /h/instructions-history
       [ -f "/h/$CFG/$FILE" ] || cp /header.md "/h/$CFG/$FILE"
-      chown 1000:1000 "/h/$CFG" "/h/$CFG/skills" "/h/$CFG/$FILE" /h/instructions-history'
+      chown 1000:1000 "/h/$CFG" "/h/$CFG/skills" "/h/$CFG/agents" "/h/$CFG/$FILE" /h/instructions-history'
 }
 
 # Build prompts/<id>.md for every agent; print the ids whose prompt changed.
@@ -163,6 +174,8 @@ build_prompts() {
       [ -f "prompts/src/$id.md" ] && { cat "prompts/src/$id.md"; echo; }
       [ "${kind:-team}" = team ] && [ -f prompts/src/_team.md ] && { cat prompts/src/_team.md; echo; }
       [ -f prompts/src/_turns.md ] && { cat prompts/src/_turns.md; echo; }
+      [ "$rt" = claude ] && [ -f prompts/src/_delegate.md ] && { cat prompts/src/_delegate.md; echo; }
+      [ "$rt" = codex ] && [ -s "$id.listen" ] && [ -f prompts/src/_ambient.md ] && { cat prompts/src/_ambient.md; echo; }
       cat prompts/_roster.md; echo
       [ -f prompts/src/_instructions.md ] && cat prompts/src/_instructions.md
     } > "$tmp"
@@ -214,6 +227,42 @@ sync_prompts() {  # rebuild; recreate only agents whose prompt/env changed
 
 runtime_of() { awk -v id="$1" '$1==id{print $2}' agents.list; }
 
+envget() { sed -n "s/^$2=//p" "$1.env" | tail -1; }            # id key
+envset() { sed -i "/^$2=/d" "$1.env"; [ -z "$3" ] || echo "$2=$3" >> "$1.env"; }   # id key value (empty = unset)
+
+# "model effort" of an agent ("default" = the runtime's own choice).
+model_of() {  # id
+  local m e
+  if [ "$(runtime_of "$1")" = claude ]; then m=$(envget "$1" ANTHROPIC_MODEL); e=$(envget "$1" CLAUDE_CODE_EFFORT_LEVEL)
+  else
+    read -r m e < <(python3 -c 'import json,sys; c=json.loads(sys.argv[1] or "{}"); print(c.get("model") or "default", c.get("model_reasoning_effort") or "default")' "$(envget "$1" CODEX_CONFIG)")
+  fi
+  echo "${m:-default} ${e:-default}"
+}
+
+set_model() {  # id model effort  ("-" keeps the current value, "default" clears it)
+  local id=$1 rt m e cur
+  rt=$(runtime_of "$id"); [ -n "$rt" ] || die "no agent $id"
+  read -r m e <<<"$(model_of "$id")"
+  [ "$2" = - ] || m=$2; [ "${3:--}" = - ] || e=$3
+  [ "$m" = default ] && m=""; [ "$e" = default ] && e=""
+  local re='^[][A-Za-z0-9._:/-]*$'; [[ "$m" =~ $re ]] || die "bad model name: $m"
+  if [ "$rt" = claude ]; then
+    [[ "$e" =~ ^(|low|medium|high|xhigh|max)$ ]] || die "claude effort: low|medium|high|xhigh|max|default"
+    envset "$id" ANTHROPIC_MODEL "$m"; envset "$id" CLAUDE_CODE_EFFORT_LEVEL "$e"
+  else
+    [[ "$e" =~ ^(|minimal|low|medium|high|xhigh)$ ]] || die "codex effort: minimal|low|medium|high|xhigh|default"
+    cur=$(python3 -c 'import json,sys
+c=json.loads(sys.argv[1] or "{}")
+for k,v in (("model",sys.argv[2]),("model_reasoning_effort",sys.argv[3])):
+    c.pop(k,None)
+    if v: c[k]=v
+print(json.dumps(c,separators=(",",":")) if c else "")' "$(envget "$id" CODEX_CONFIG)" "$m" "$e")
+    envset "$id" CODEX_CONFIG "$cur"
+  fi
+  echo "$id: model ${m:-default}, effort ${e:-default}"
+}
+
 set_profile() {  # id name about
   for i in $(seq 20); do dc exec -T "$1" true </dev/null >/dev/null 2>&1 && break; sleep 2; done
   dc exec -T "$1" buzz users set-profile --name "$2" --about "$3" </dev/null | grep -q '"accepted":true' \
@@ -231,19 +280,51 @@ login_codex() {
 cmd=${1:-list}; shift || true
 case "$cmd" in
   list)
-    printf "%-10s %-7s %-22s %s\n" ID RUNTIME STATUS NPUB
+    printf "%-10s %-7s %-16s %-22s %s\n" ID RUNTIME MODEL STATUS NPUB
     while read -r id rt _; do
       [ -z "${id:-}" ] && continue
       st=$(docker inspect -f '{{.State.Status}}' "buzz-agents-$id-1" 2>/dev/null | head -1 || true); [ -n "$st" ] || st="not created"
-      printf "%-10s %-7s %-22s %s\n" "$id" "$rt" "$st" "$(npub "$(cat "$id.pub")")"
+      printf "%-10s %-7s %-16s %-22s %s\n" "$id" "$rt" "$(model_of "$id" | tr ' ' /)" "$st" "$(npub "$(cat "$id.pub")")"
     done < agents.list ;;
+
+  model)
+    id=${1:?id}; shift; [ -n "$(runtime_of "$id")" ] || die "no agent $id"
+    restart=1; pos=()
+    for a in "$@"; do [ "$a" = --no-restart ] && restart=0 || pos+=("$a"); done
+    if [ ${#pos[@]} -eq 0 ]; then read -r m e <<<"$(model_of "$id")"; echo "$id: model $m, effort $e"; exit 0; fi
+    set_model "$id" "${pos[0]}" "${pos[1]:--}"
+    if [ $restart = 1 ]; then dc up -d --force-recreate "$id" 2>&1 | grep -E "Started|Error" || true; fi ;;
+
+  runtime)
+    id=${1:?id}; new=${2:?runtime}; [[ "$new" =~ ^(claude|codex)$ ]] || die "runtime must be claude or codex"
+    old=$(runtime_of "$id"); [ -n "$old" ] || die "no agent $id"
+    [ "$old" = "$new" ] && { echo "$id already runs $new"; exit 0; }
+    # Model names don't carry across runtimes: clear them (set new ones with: agentctl model).
+    for k in ANTHROPIC_MODEL CLAUDE_CODE_EFFORT_LEVEL CODEX_CONFIG; do envset "$id" "$k" ""; done
+    envset "$id" BUZZ_ACP_AGENT_COMMAND "$([ "$new" = claude ] && echo claude-agent-acp || echo codex-acp)"
+    awk -v id="$id" -v rt="$new" '$1==id{$2=rt}1' agents.list > agents.list.new && mv agents.list.new agents.list
+    # Carry the team-editable standing instructions over (same home volume; memory and workspace stay).
+    if [ "$new" = claude ]; then from=.codex/AGENTS.md; to=.claude/CLAUDE.md; else from=.claude/CLAUDE.md; to=.codex/AGENTS.md; fi
+    docker run --rm -v "buzz-agents_$id-home:/h" -e FROM="$from" -e TO="$to" alpine sh -c '
+      mkdir -p "/h/$(dirname "$TO")"
+      [ -f "/h/$FROM" ] && [ ! -f "/h/$TO" ] && cp "/h/$FROM" "/h/$TO" && chown 1000:1000 "/h/$(dirname "$TO")" "/h/$TO" || true'
+    prep_home "$id" "$new"
+    render
+    echo "$id: $old -> $new"
+    if [ "${3:-}" != --no-restart ]; then
+      dc rm -sf "$id" >/dev/null 2>&1 || true
+      sync_prompts   # the roster's Runtime column changed for everyone
+      dc up -d "$id" 2>&1 | grep -E "Started|Error" || true
+      if [ "$new" = codex ]; then echo "codex sign-in needed: agentctl login-codex $id"; fi
+    fi ;;
 
   add)
     id=${1:?id}; rt=${2:?runtime}; shift 2
-    name=""; about=""; respond="owner-only"; mem="2g"; kind="team"
+    name=""; about=""; respond="owner-only"; mem="2g"; kind="team"; model="-"; effort="-"
     while [ $# -gt 0 ]; do case "$1" in
       --name) name=$2; shift 2;; --about) about=$2; shift 2;;
       --respond-to) respond=$2; shift 2;; --mem) mem=$2; shift 2;; --kind) kind=$2; shift 2;;
+      --model) model=$2; shift 2;; --effort) effort=$2; shift 2;;
       *) die "unknown option $1";; esac; done
     [[ "$id" =~ ^[a-z][a-z0-9-]{1,30}$ ]] || die "id must be lowercase letters/digits/dashes"
     [[ "$rt" =~ ^(claude|codex)$ ]] || die "runtime must be claude or codex"
@@ -264,6 +345,7 @@ case "$cmd" in
     printf '%s\n%s\n' "$name" "$about" > "$id.meta"
     echo "$pk" > "$id.pub"; chmod 644 "$id.pub"
     echo "$id $rt $mem $kind" >> agents.list
+    [ "$model$effort" = -- ] || set_model "$id" "$model" "$effort"
     render
     dc create "$id" >/dev/null 2>&1
     prep_home "$id" "$rt"

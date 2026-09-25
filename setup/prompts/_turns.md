@@ -1,7 +1,7 @@
 ## When a message mentions several agents
 
 If the message you are answering @mentions you **and at least one other AI agent**, don't reply
-straight away. First run, with a timeout of at least 6 minutes (it may wait for the others):
+straight away. First run, with a timeout of at least 4 minutes (it may wait for the others):
 
 ```
 turn-gate --channel <channel UUID from <context>> --event <Event ID of that message>

@@ -15,7 +15,7 @@
 // anything is left for them. Fails open: any error prints REPLY.
 //
 // Env: TYPESAFE_API_KEY (required), AGENT_PUBKEY (this agent), TURN_GATE_STEP (seconds of waiting
-// per agent ahead, default 120), TURN_GATE_MAX_WAIT (default 300), TURN_GATE_POLL (default 10).
+// per agent ahead, default 60), TURN_GATE_MAX_WAIT (default 180), TURN_GATE_POLL (default 10).
 'use strict';
 const { execFileSync } = require('child_process');
 const fs = require('fs');
@@ -24,8 +24,8 @@ const API = process.env.TYPESAFE_API_URL || 'https://api.typesafe.ai/v1/systemon
 const MODEL = process.env.TYPESAFE_MODEL || 'jev-latest';
 const ROSTER = process.env.TURN_GATE_ROSTER || '/prompts/_roster.md';
 const LOG = `${process.env.HOME || '/tmp'}/.turn-gate.log`;
-const STEP = +(process.env.TURN_GATE_STEP || 120);
-const MAX_WAIT = +(process.env.TURN_GATE_MAX_WAIT || 300);
+const STEP = +(process.env.TURN_GATE_STEP || 60);
+const MAX_WAIT = +(process.env.TURN_GATE_MAX_WAIT || 180);
 const POLL = +(process.env.TURN_GATE_POLL || 10);
 const PARALLEL = 0.6;   // noul above this: the message gives each agent its own ask -> everyone replies now
 const TIE = 0.15;       // choice probabilities this close count as a tie -> roster order decides

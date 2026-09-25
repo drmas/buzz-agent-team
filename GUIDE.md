@@ -15,7 +15,10 @@ Buzz identity, storage and memory.
 | `pm` | Claude Code | Product manager | #general, #product |
 | `designer` | Claude Code | Product and UX designer | #design |
 | `marketing` | Claude Code | Marketing | #marketing |
-| `engineer` | Codex | Software engineer | #engineering |
+| `engineer` | Claude Code | Software engineer | #engineering |
+
+Default models: Sonnet (medium effort) for PM, Designer and Marketing; Opus (medium) for `claude`
+and `engineer`; Codex's default model at medium reasoning for `codex`. See "Models and effort" below.
 
 All of them answer anyone in the community when mentioned. Only the owner can DM them.
 When one message mentions several of them, they take turns (see "Taking turns" below).
@@ -124,11 +127,58 @@ Expect the second agent to answer a minute or two after the first. Every decisio
 probabilities, is logged in the agent's `~/.turn-gate.log` (`buzz-team shell pm`, then
 `tail ~/.turn-gate.log`). No TypeSafe key, or any error, means `REPLY`: the old behaviour.
 
+## Models and effort
+
+Each agent has one main model and effort level, set for its everyday work. On the server:
+
+```bash
+agentctl model pm                  # show
+agentctl model pm opus high        # change model and effort, restarts the agent
+agentctl model pm - low            # change only the effort (- keeps the current value)
+agentctl model pm default          # back to the runtime's default model
+```
+
+Claude efforts: `low`, `medium`, `high`, `xhigh`, `max`. Codex efforts: `minimal`, `low`,
+`medium`, `high`, `xhigh`. Claude model names: `sonnet`, `opus`, `haiku`, `fable`, or a full model id.
+
+Claude agents can also switch models within a single task through two subagents:
+
+| Subagent | Model | Used for |
+|---|---|---|
+| `deep-work` | Opus | Specs, plans, designs, multi-file code changes, reviews, careful analysis |
+| `scout` | Haiku | Reading long threads, searching memory and files, collecting facts |
+
+The agents decide when to delegate (rule in `prompts/_delegate.md`). You can also ask directly:
+"@PM use deep-work to write the full spec".
+
+## Ambient gate: fewer wasted turns
+
+Agents read every human message in their channels, but most need no reply. Before the main model
+runs, `ambient-gate` asks a fast model (Jev, or Haiku without a TypeSafe key) whether the message
+is for this agent. If it clearly isn't, the turn ends right away: no tokens, no reply. Mentions,
+DMs and scheduled check-ins always go through. Decisions are logged in each agent's
+`~/.ambient-gate.log`:
+
+```bash
+buzz-team shell pm
+tail ~/.ambient-gate.log
+grep -c '"SKIP"' ~/.ambient-gate.log    # turns saved
+```
+
+To move an agent between Claude Code and Codex (keeps its Buzz identity, memory, workspace and
+standing instructions; set its model again afterwards):
+
+```bash
+agentctl runtime engineer codex && agentctl login-codex engineer
+```
+
 ## On the server (as root, `buzz-team server`)
 
 | Command | What it does |
 |---|---|
-| `agentctl list` | Agents and status |
+| `agentctl list` | Agents, model/effort and status |
+| `agentctl model <agent> [model] [effort]` | Show or change an agent's model and effort |
+| `agentctl runtime <agent> claude\|codex` | Switch an agent between Claude Code and Codex |
 | `agentctl restart <agent>` / `agentctl logs <agent> 100` | Restart / logs |
 | `agentctl listen <agent> <channel> …` | Channels it reads without a mention (none = mentions only) |
 | `agentctl respond-to <agent> owner-only\|anyone` | Who it answers |
@@ -150,3 +200,6 @@ editing it, run `agentctl sync`. (Better: edit `setup/prompts/_people.md` and ru
 | Agent doesn't reply | Check it's a member of the channel and `buzz-team logs <agent>` |
 | Agents still answer on top of each other | Check `~/.turn-gate.log` in each: `gate off (no TYPESAFE_API_KEY)` means the key isn't loaded (`./deploy-team.sh`) |
 | Second agent is too slow | Lower `STEP` / `MAX_WAIT` at the top of `setup/tools/turn-gate`, then `./deploy-team.sh` |
+| Second agent repeats the first one | The first reply took longer than `STEP` (60 s); raise it in `setup/tools/turn-gate` |
+| Agent ignores a message it should have answered | Check `~/.ambient-gate.log` for a `SKIP`; mention the agent, or lower `AMBIENT_GATE_MIN` |
+| Agent answers too slowly or too shallowly | `agentctl model <agent> …` (lower effort for speed, `opus`/higher effort for depth) |

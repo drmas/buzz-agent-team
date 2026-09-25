@@ -9,18 +9,18 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 BUILD=$(mktemp -d); trap 'rm -rf "$BUILD"' EXIT
 mkdir -p "$BUILD/prompts/src"
 cp "$HERE/agentctl" "$HERE/instructions-header.md" "$BUILD/"
-cp -r "$HERE/skills" "$HERE/tools" "$BUILD/"
+cp -r "$HERE/skills" "$HERE/tools" "$HERE/claude" "$BUILD/"
 cp "$HERE"/prompts/*.md "$BUILD/prompts/src/"
 # fill in {{TEAM_NAME}} / {{OWNER_NAME}}
 TEAM_NAME="$TEAM_NAME" OWNER_NAME="$OWNER_NAME" perl -pi -e 's/\{\{(TEAM_NAME|OWNER_NAME)\}\}/$ENV{$1}/g' "$BUILD"/prompts/src/*.md
-BUNDLE=$(tar -C "$BUILD" -czf - agentctl instructions-header.md prompts skills tools | base64 -w0)
+BUNDLE=$(tar -C "$BUILD" -czf - agentctl instructions-header.md prompts skills tools claude | base64 -w0)
 
 cat > "$BUILD/remote.sh" <<REMOTE
 set -euo pipefail
 cd /opt/buzz-agents
 echo "$BUNDLE" | base64 -d | tar -xzf - -C /opt/buzz-agents
 chmod 700 agentctl; ln -sf /opt/buzz-agents/agentctl /usr/local/bin/agentctl
-chmod 755 prompts prompts/src skills skills/* tools tools/*; chmod 644 prompts/src/*.md skills/*/* instructions-header.md
+chmod 755 prompts prompts/src skills skills/* tools tools/* claude claude/agents; chmod 644 prompts/src/*.md skills/*/* instructions-header.md claude/*.json claude/agents/*
 # turn-gate: (re)write the TypeSafe key line in refresh-secrets.sh (servers set up before it existed)
 sed -i '/typesafe/d;/turn-gate/d' refresh-secrets.sh
 cat >> refresh-secrets.sh <<'EOF'
@@ -41,11 +41,21 @@ meta designer  Designer  "Product & UX designer: flows, UI specs, mockups, desig
 meta marketing Marketing "Marketing: positioning, copy, launches, content."
 meta engineer  Engineer  "Software engineer: technical design, code, estimates, reviews."
 agentctl prep-all
+# engineer moved from Codex to Claude Code: same identity, memory, workspace and instructions
+if [ "\$(awk '\$1=="engineer"{print \$2}' agents.list)" = codex ]; then agentctl runtime engineer claude --no-restart; fi
 add() { grep -q "^\$1 " agents.list && echo "exists: \$1" || agentctl add "\$@"; }
 add pm        claude --name PM        --respond-to anyone --about "Product manager: specs, priorities, task breakdown, status."
 add designer  claude --name Designer  --respond-to anyone --about "Product & UX designer: flows, UI specs, mockups, design review."
 add marketing claude --name Marketing --respond-to anyone --about "Marketing: positioning, copy, launches, content."
-add engineer  codex  --name Engineer  --respond-to anyone --about "Software engineer: technical design, code, estimates, reviews."
+add engineer  claude --name Engineer  --respond-to anyone --about "Software engineer: technical design, code, estimates, reviews."
+# model + effort per role, only where none is set yet (change later with: agentctl model <id> …)
+defmodel() { grep -qE '^(ANTHROPIC_MODEL|CLAUDE_CODE_EFFORT_LEVEL|CODEX_CONFIG)=' "\$1.env" || agentctl model "\$@" --no-restart; }
+defmodel claude    opus    medium    # general assistant: strongest model, everyday effort
+defmodel pm        sonnet  medium    # conversation, specs, summaries; deep-work subagent for heavy lifting
+defmodel designer  sonnet  medium
+defmodel marketing sonnet  medium
+defmodel engineer  opus    medium    # design and code: strongest model, everyday effort
+defmodel codex     default medium    # Codex default model; effort up from Codex's default (low)
 agentctl sync
 # keep Buzz profiles in step with the roster
 for id in claude codex pm designer marketing engineer; do
