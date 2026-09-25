@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+# buzz-team — one-step access to your Buzz agents on AWS (via SSM Session Manager).
+#
+#   buzz-team list                 agents, runtime, status
+#   buzz-team shell  <agent>       bash inside the agent's container (its home, its tools)
+#   buzz-team claude <agent>       Claude Code TUI in that container  (/plugin, /mcp, /login …)
+#   buzz-team codex  <agent>       Codex TUI in that container        (/mcp, login …)
+#   buzz-team restart <agent>      restart it (do this after installing plugins/MCP servers)
+#   buzz-team logs <agent> [n]     last n log lines (default 60)
+#   buzz-team server               root shell on the server (agentctl lives there)
+#
+# Plugins/MCP servers installed from `shell`/`claude`/`codex` are saved in the agent's own home,
+# so the agent itself uses them after a restart. Requires: aws CLI + session-manager-plugin,
+# and BUZZ_TEAM_INSTANCE=<instance id> (BUZZ_TEAM_REGION defaults to us-east-1).
+set -euo pipefail
+REGION=${BUZZ_TEAM_REGION:-us-east-1}
+INSTANCE=${BUZZ_TEAM_INSTANCE:?set BUZZ_TEAM_INSTANCE=<instance id> in your shell profile}
+DC="docker compose -p buzz-agents -f /opt/buzz-agents/compose.yml"
+
+aws sts get-caller-identity >/dev/null 2>&1 || { echo "AWS session expired - signing in…"; aws login; }
+
+run() {  # interactive command on the server, with a TTY
+  aws ssm start-session --region "$REGION" --target "$INSTANCE" \
+    --document-name AWS-StartInteractiveCommand \
+    --parameters "$(python3 -c 'import json,sys; print(json.dumps({"command":[sys.argv[1]]}))' "$1")"
+}
+agent() {
+  [[ "${1:-}" =~ ^[a-z][a-z0-9-]{1,30}$ ]] || { echo "usage: buzz-team $cmd <agent>   (see: buzz-team list)" >&2; exit 1; }
+  echo "$1"
+}
+
+cmd=${1:-help}; shift || true
+case "$cmd" in
+  list)    run "sudo /opt/buzz-agents/agentctl list" ;;
+  shell)   a=$(agent "${1:-}"); run "sudo $DC exec -w /home/agent $a bash -l" ;;
+  claude)  a=$(agent "${1:-}"); run "sudo $DC exec -w /workspace $a claude" ;;
+  codex)   a=$(agent "${1:-}"); run "sudo $DC exec -w /workspace $a codex" ;;
+  restart) a=$(agent "${1:-}"); run "sudo /opt/buzz-agents/agentctl restart $a" ;;
+  logs)    a=$(agent "${1:-}"); run "sudo /opt/buzz-agents/agentctl logs $a ${2:-60}" ;;
+  server)  run "sudo -i" ;;
+  *) sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//' ;;
+esac

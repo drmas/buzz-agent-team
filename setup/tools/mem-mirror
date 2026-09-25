@@ -1,0 +1,64 @@
+#!/bin/bash
+# mem-mirror — copy ~/memory into the agent's Buzz memory (NIP-AE engrams, encrypted to the owner)
+# so it survives server loss and the owner can read it in Buzz Desktop. One-way (files → Buzz).
+# Only changed files are pushed (sha256 state in ~/.mem-mirror.state); files deleted locally are
+# tombstoned. Harness core-memory injection stays off, so this adds no prompt tokens.
+set -euo pipefail
+M="${MEMORY_DIR:-$HOME/memory}"; STATE="$HOME/.mem-mirror.state"; NAME="${1:-agent}"
+[ -d "$M" ] || { echo "no memory yet"; exit 0; }
+touch "$STATE"
+
+# First run: keep whatever the agent previously wrote to its Buzz core memory.
+if ! grep -q '^core ' "$STATE"; then
+  old=$(buzz mem get core 2>/dev/null || true)
+  if [ -n "${old//[[:space:]]/}" ] && [[ "$old" != *"mirrored nightly from ~/memory"* ]] && [ ! -f "$M/legacy-core.md" ]; then
+    { printf '# legacy-core\n\n> What I wrote to my Buzz core memory before file memory existed\n\n'; printf '%s\n' "$old"; } > "$M/legacy-core.md"
+    grep -qF '`legacy-core.md`' "$M/INDEX.md" 2>/dev/null || echo '- `legacy-core.md` — what I wrote to my Buzz core memory before file memory existed' >> "$M/INDEX.md"
+    echo "saved previous core to legacy-core.md"
+  fi
+fi
+
+slug_for() {  # memory-relative path -> NIP-AE slug (mem/…)
+  local p=${1%.md} out="" seg
+  [ "$p" = INDEX ] && { echo "mem/index"; return; }
+  p=$(printf '%s' "$p" | tr 'A-Z' 'a-z' | sed 's/[^a-z0-9_/-]/-/g')
+  IFS=/ read -ra parts <<<"$p"
+  for seg in "${parts[@]}"; do
+    [ -n "$seg" ] || continue
+    [[ "$seg" =~ ^[a-z0-9] ]] || seg="x$seg"
+    out="$out/${seg:0:64}"
+  done
+  echo "mem${out}"
+}
+
+pushed=0 same=0 removed=0 failed=0
+declare -A seen
+mapfile -t files < <(cd "$M" && find . -name '*.md' -type f | sed 's|^\./||' | sort)
+links=""; for f in "${files[@]}"; do [ "$f" = INDEX.md ] || links="$links [[$(slug_for "$f")]]"; done
+
+for f in "${files[@]}"; do
+  slug=$(slug_for "$f"); seen[$slug]=1
+  value=$(cat "$M/$f")
+  [ "$f" = INDEX.md ] && value="$value"$'\n\n'"Links:$links"
+  [ -n "${value//[[:space:]]/}" ] || continue
+  h=$(printf '%s' "$value" | sha256sum | cut -d' ' -f1)
+  if grep -qx "$slug $h" "$STATE"; then same=$((same + 1)); continue; fi
+  if printf '%s' "$value" | buzz mem set "$slug" - >/dev/null 2>&1; then
+    sed -i "\|^$slug |d" "$STATE"; echo "$slug $h" >> "$STATE"; pushed=$((pushed + 1))
+  else failed=$((failed + 1)); echo "failed: $slug" >&2; fi
+done
+
+# tombstone slugs whose files were deleted
+while read -r slug _; do
+  [ -z "$slug" ] || [ "$slug" = core ] || [ -n "${seen[$slug]:-}" ] && continue
+  if buzz mem rm "$slug" >/dev/null 2>&1; then sed -i "\|^$slug |d" "$STATE"; removed=$((removed + 1))
+  else echo "could not tombstone $slug" >&2; fi
+done < "$STATE"
+
+# core: a short pointer only (never injected into prompts while BUZZ_ACP_NO_MEMORY=true)
+core="$NAME — long-term memory, mirrored nightly from ~/memory on the team server. Start at [[mem/index]]; open tasks in [[mem/tasks]]."
+hc=$(printf '%s' "$core" | sha256sum | cut -d' ' -f1)
+if ! grep -qx "core $hc" "$STATE"; then
+  printf '%s' "$core" | buzz mem set core - >/dev/null 2>&1 && { sed -i '/^core /d' "$STATE"; echo "core $hc" >> "$STATE"; } || echo "failed: core" >&2
+fi
+echo "mirror: pushed=$pushed unchanged=$same removed=$removed failed=$failed"

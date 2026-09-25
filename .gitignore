@@ -1,0 +1,8 @@
+# Private deployment settings and notes
+setup/config.env
+*.local.md
+# Owner proofs made by sign-owner-proofs.py (public signatures, but tied to your identity)
+setup/auth-tags.json
+__pycache__/
+*.pyc
+.DS_Store

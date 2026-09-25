@@ -1,0 +1,173 @@
+#!/usr/bin/env node
+// turn-gate — decide whether this agent should reply now, wait for another agent, or stay silent,
+// when one message mentions several agents. Uses TypeSafe's Jev model (https://docs.typesafe.ai).
+//
+//   turn-gate --channel <uuid> --event <event-id>
+//
+// Prints one decision line (plus a short reason) and exits 0:
+//   REPLY         reply now
+//   REPLY-AFTER   other agents replied first: read their replies, add only what's new from your area
+//   SKIP          the other replies already cover your part: send nothing
+//
+// How: every mentioned agent asks Jev the same question about the same thread snapshot ("who should
+// reply first?"), so they all get the same order without talking to each other. Agents that aren't
+// first wait (polling the thread) until the agents ahead of them have replied, then ask Jev whether
+// anything is left for them. Fails open: any error prints REPLY.
+//
+// Env: TYPESAFE_API_KEY (required), AGENT_PUBKEY (this agent), TURN_GATE_STEP (seconds of waiting
+// per agent ahead, default 120), TURN_GATE_MAX_WAIT (default 300), TURN_GATE_POLL (default 10).
+'use strict';
+const { execFileSync } = require('child_process');
+const fs = require('fs');
+
+const API = process.env.TYPESAFE_API_URL || 'https://api.typesafe.ai/v1/systemone';
+const MODEL = process.env.TYPESAFE_MODEL || 'jev-latest';
+const ROSTER = process.env.TURN_GATE_ROSTER || '/prompts/_roster.md';
+const LOG = `${process.env.HOME || '/tmp'}/.turn-gate.log`;
+const STEP = +(process.env.TURN_GATE_STEP || 120);
+const MAX_WAIT = +(process.env.TURN_GATE_MAX_WAIT || 300);
+const POLL = +(process.env.TURN_GATE_POLL || 10);
+const PARALLEL = 0.6;   // noul above this: the message gives each agent its own ask -> everyone replies now
+const TIE = 0.15;       // choice probabilities this close count as a tie -> roster order decides
+const COVERED = 0.6;    // noul above this after waiting: nothing left for me -> SKIP
+const HANDOFF = 0.5;    // noul above this: a reply asked me for something -> REPLY-AFTER
+const MAX_MSGS = 20, MAX_CHARS = 1500;
+
+const args = process.argv.slice(2);
+const arg = (n) => { const i = args.indexOf(`--${n}`); return i >= 0 ? args[i + 1] : undefined; };
+const channel = arg('channel'), event = arg('event');
+const sleep = (s) => new Promise((r) => setTimeout(r, s * 1000));
+
+function done(decision, reason, extra = {}) {
+  console.log(`${decision}: ${reason}`);
+  try { fs.appendFileSync(LOG, JSON.stringify({ t: new Date().toISOString(), channel, event, decision, reason, ...extra }) + '\n'); } catch {}
+  process.exit(0);
+}
+
+// Agents from the generated "Who's who" table: | Name | `pubkey` | Runtime | Responds to | Listens | About |
+function roster() {
+  const agents = [];
+  for (const line of fs.readFileSync(ROSTER, 'utf8').split('\n')) {
+    const m = line.match(/^\| (.+?) \| `([0-9a-f]{64})` \| .+? \| (.+?) \| .+? \| (.*) \|$/);
+    if (m && m[3] !== 'nobody') agents.push({ name: m[1], pubkey: m[2], about: m[4] });
+  }
+  return agents;
+}
+
+function thread() {
+  const out = execFileSync('buzz', ['messages', 'thread', '--channel', channel, '--event', event, '--limit', '100'],
+    { encoding: 'utf8', timeout: 30000, stdio: ['ignore', 'pipe', 'pipe'] });
+  return JSON.parse(out).filter((e) => e.kind === 9).sort((a, b) => a.created_at - b.created_at);
+}
+
+async function ask(state, questions) {
+  const res = await fetch(API, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${process.env.TYPESAFE_API_KEY}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ state, model: MODEL, questions }),
+    signal: AbortSignal.timeout(20000),
+  });
+  if (!res.ok) throw new Error(`TypeSafe HTTP ${res.status}: ${(await res.text()).slice(0, 200)}`);
+  return (await res.json()).answers;
+}
+
+async function main() {
+  if (!channel || !/^[0-9a-f]{64}$/.test(event || '')) {
+    console.error('usage: turn-gate --channel <uuid> --event <event-id>'); process.exit(1);
+  }
+  if (!process.env.TYPESAFE_API_KEY) return done('REPLY', 'gate off (no TYPESAFE_API_KEY)');
+  const me = process.env.AGENT_PUBKEY;
+  const agents = roster();
+  const self = agents.find((a) => a.pubkey === me);
+  if (!self) return done('REPLY', 'gate off (AGENT_PUBKEY not in roster)');
+  const byKey = Object.fromEntries(agents.map((a) => [a.pubkey, a]));
+  const who = (pk) => (byKey[pk] ? `${byKey[pk].name} (AI agent)` : 'a human teammate');
+  const msg = (e) => ({ from: who(e.pubkey), text: e.content.slice(0, MAX_CHARS) });
+
+  const events = thread();
+  const idx = events.findIndex((e) => e.id === event);
+  if (idx < 0) return done('REPLY', 'gate off (event not found in thread)');
+  const trigger = events[idx];
+  const mentioned = [...new Set(trigger.tags.filter((t) => t[0] === 'p').map((t) => t[1]))]
+    .filter((pk) => byKey[pk] && pk !== trigger.pubkey);
+  if (!mentioned.includes(me) || mentioned.length < 2) return done('REPLY', 'not a multi-agent mention');
+  const candidates = agents.filter((a) => mentioned.includes(a.pubkey)); // roster order = tie-break
+
+  // 1) Order. The state is the thread up to the trigger, with nothing about "me", so every mentioned
+  //    agent sends the same request and gets the same answer.
+  const state = {
+    conversation: events.slice(Math.max(0, idx - MAX_MSGS), idx).map(msg),
+    latest_message: msg(trigger),
+    mentioned_agents: Object.fromEntries(candidates.map((a) => [a.name, a.about])),
+  };
+  const a1 = await ask(state, {
+    first: {
+      type: 'choice',
+      instructions: '`latest_message` mentions several AI agents, listed in `mentioned_agents` with their areas. ' +
+        'Which one of them should reply first: the one whose area is most central to what `latest_message` asks, ' +
+        'or whose answer the other agents need before they can give theirs?',
+      criteria: Object.fromEntries(candidates.map((a) => [a.name, a.about])),
+    },
+    parallel: {
+      type: 'noul',
+      instructions: 'Does `latest_message` give each agent in `mentioned_agents` its own separate question or task, ' +
+        'so each one can answer fully without seeing the other agents\' replies?',
+      criteria: {
+        true: 'Separate asks per agent (for example "PM: scope it, Designer: mock it") or a request for each agent\'s own independent opinion',
+        false: 'One shared question or task, where the agents\' answers would overlap or build on each other',
+      },
+    },
+  });
+  const probs = a1.first.probabilities;
+  const extra = { first: probs, parallel: a1.parallel.noul, model_confidence: a1.first.confidence };
+  if (a1.parallel.noul >= PARALLEL) return done('REPLY', `each agent has its own ask (parallel=${a1.parallel.noul.toFixed(2)})`, extra);
+
+  const order = candidates
+    .map((a, i) => ({ ...a, p: probs[a.name] || 0, i }))
+    .sort((x, y) => Math.round(y.p / TIE) - Math.round(x.p / TIE) || x.i - y.i);
+  const rank = order.findIndex((a) => a.pubkey === me);
+  const orderText = order.map((a) => `${a.name} ${a.p.toFixed(2)}`).join(', ');
+  if (rank === 0) return done('REPLY', `you go first (${orderText})`, extra);
+
+  // 2) Wait for the agents ahead of me to reply in the thread (or time out).
+  const ahead = order.slice(0, rank);
+  const deadline = Date.now() + Math.min(MAX_WAIT, STEP * rank) * 1000;
+  let later = [];
+  for (;;) {
+    later = thread().filter((e) => e.created_at >= trigger.created_at && e.id !== event);
+    const repliedAgents = new Set(later.map((e) => e.pubkey));
+    if (ahead.every((a) => repliedAgents.has(a.pubkey)) || Date.now() >= deadline) break;
+    console.error(`waiting for ${ahead.filter((a) => !repliedAgents.has(a.pubkey)).map((a) => a.name).join(', ')}…`);
+    await sleep(POLL);
+  }
+  const waited = `waited for ${ahead.map((a) => a.name).join(', ')}`;
+  if (!later.length) return done('REPLY', `${waited}; nobody replied in time (${orderText})`, extra);
+
+  // 3) Is anything left for me?
+  const a2 = await ask({
+    conversation: state.conversation,
+    latest_message: state.latest_message,
+    replies_since: later.slice(-MAX_MSGS).map(msg),
+    agent_area: { name: self.name, area: self.about },
+  }, {
+    handoff: {
+      type: 'noul',
+      instructions: 'Does any message in `replies_since` ask the agent named in `agent_area` to answer, review, or do something?',
+    },
+    covered: {
+      type: 'noul',
+      instructions: 'Do the messages in `replies_since` already fully answer the parts of `latest_message` that fall in `agent_area`?',
+      criteria: {
+        true: 'Nothing substantial from `agent_area` is left to add',
+        false: 'Some part of `latest_message` that belongs to `agent_area` is still unanswered or answered only partly',
+      },
+    },
+  });
+  Object.assign(extra, { handoff: a2.handoff.noul, covered: a2.covered.noul });
+  const names = [...new Set(later.map((e) => who(e.pubkey).replace(' (AI agent)', '')))].join(', ');
+  if (a2.handoff.noul >= HANDOFF) return done('REPLY-AFTER', `${waited}; ${names} replied and asked you for something. Answer that, don't repeat them`, extra);
+  if (a2.covered.noul >= COVERED) return done('SKIP', `${waited}; ${names} already covered your part (covered=${a2.covered.noul.toFixed(2)}). Send nothing`, extra);
+  return done('REPLY-AFTER', `${waited}; ${names} replied. Read their replies and add only what's new from your area`, extra);
+}
+
+main().catch((e) => done('REPLY', `gate error (${String(e.message || e).slice(0, 160)})`));

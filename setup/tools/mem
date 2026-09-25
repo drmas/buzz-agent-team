@@ -1,0 +1,90 @@
+#!/bin/bash
+# mem — token-frugal file memory for Buzz agents. All output is capped; nothing is ever dumped whole.
+#
+#   mem find <word> [word...]     where is it? (≤20 matching lines, index hits first)
+#   mem show <file> [from] [n]    read a slice of one file (default: first 40 lines)
+#   mem index                     list memory files with one-line hooks (≤80 lines)
+#   mem new <file> "<hook>"       create a topic file and register it in INDEX.md
+#   mem add <file> "<fact>"       append a dated bullet to a topic file
+#   mem log "<event>"             append one line to this month's history log
+#   mem task add "<task>" | done <n> | list
+#   mem stats                     sizes vs. budgets, and what needs consolidating
+#
+# <file> is relative to ~/memory, e.g. people/mo.md, projects/landing-page.md, decisions/2026.md
+set -euo pipefail
+M="${MEMORY_DIR:-$HOME/memory}"
+IDX="$M/INDEX.md"; TASKS="$M/tasks.md"
+MAX_INDEX=80 MAX_FILE=80 MAX_LINE=300
+mkdir -p "$M/log"
+[ -f "$IDX" ] || printf '# Memory index\n\nOne line per file: `path` — what it holds. Keep under %s lines.\n\n' "$MAX_INDEX" > "$IDX"
+[ -f "$TASKS" ] || printf '# Open tasks and commitments\n\n' > "$TASKS"
+today() { date -u +%Y-%m-%d; }
+die() { echo "mem: $*" >&2; exit 1; }
+safe() {  # validate a relative .md path inside $M
+  local p=$1
+  [[ "$p" =~ ^[a-z0-9][a-z0-9._/-]*\.md$ && "$p" != *..* ]] || die "file must be a relative lowercase path ending in .md (e.g. projects/launch.md)"
+  printf '%s' "$M/$p"
+}
+oneline() { local s="${*//$'\n'/ }"; [ ${#s} -le $MAX_LINE ] || die "keep it under $MAX_LINE characters (${#s} given); summarize"; printf '%s' "$s"; }
+
+cmd=${1:-help}; shift || true
+case "$cmd" in
+  find)
+    [ $# -gt 0 ] || die "usage: mem find <word> [word...]"
+    args=(); for w in "$@"; do args+=(-e "$w"); done
+    { rg -i -n --no-heading -m 3 "${args[@]}" "$IDX" 2>/dev/null | sed "s|^|INDEX:|; s|$M/||"
+      rg -i -n --no-heading -m 3 --sortr modified -g '!INDEX.md' "${args[@]}" "$M" 2>/dev/null | sed "s|$M/||"
+    } | cut -c1-220 | head -20
+    ;;
+  show)
+    f=$(safe "${1:?usage: mem show <file> [from] [n]}"); [ -f "$f" ] || die "no such file: $1"
+    from=${2:-1}; n=${3:-40}; [ "$n" -le 80 ] || n=80
+    total=$(wc -l < "$f"); end=$((from + n - 1))
+    awk -v a="$from" -v b="$end" 'NR>=a && NR<=b {printf "%4d  %s\n", NR, substr($0,1,300)}' "$f"
+    [ "$end" -lt "$total" ] && echo "… ($total lines; next: mem show $1 $((end + 1)))" || true
+    ;;
+  index) head -n "$MAX_INDEX" "$IDX" ;;
+  new)
+    p=${1:?usage: mem new <file> \"<hook>\"}; f=$(safe "$p"); hook=$(oneline "${2:?hook required}")
+    [ -e "$f" ] && die "$p exists; use mem add"
+    mkdir -p "$(dirname "$f")"
+    printf '# %s\n\n> %s\n\n' "$(basename "$p" .md)" "$hook" > "$f"
+    grep -qF "\`$p\`" "$IDX" || echo "- \`$p\` — $hook" >> "$IDX"
+    echo "created $p"
+    ;;
+  add)
+    p=${1:?usage: mem add <file> \"<fact>\"}; f=$(safe "$p"); fact=$(oneline "${2:?fact required}")
+    [ -f "$f" ] || die "no such file: $p (create it first: mem new $p \"<hook>\")"
+    echo "- $(today) $fact" >> "$f"
+    n=$(wc -l < "$f"); echo "added to $p ($n lines)"
+    [ "$n" -le "$MAX_FILE" ] || echo "note: $p is over $MAX_FILE lines; consolidate it (merge duplicates, drop stale lines)"
+    ;;
+  log)
+    ev=$(oneline "${1:?usage: mem log \"<event>\"}")
+    echo "- $(date -u '+%Y-%m-%d %H:%M') $ev" >> "$M/log/$(date -u +%Y-%m).md"; echo "logged"
+    ;;
+  task)
+    sub=${1:-list}; shift || true
+    case "$sub" in
+      add) t=$(oneline "${1:?usage: mem task add \"<task>\"}"); echo "- [ ] $t (added $(today))" >> "$TASKS"; echo "task added" ;;
+      done)
+        n=${1:?usage: mem task done <n>}
+        line=$(grep -n '^- \[ \]' "$TASKS" | sed -n "${n}p" | cut -d: -f1); [ -n "$line" ] || die "no open task #$n"
+        sed -i "${line}s/^- \[ \]/- [x]/; ${line}s/\$/ (done $(today))/" "$TASKS"
+        # keep only the 20 most recent completed tasks
+        for l in $(grep -n '^- \[x\]' "$TASKS" | cut -d: -f1 | awk '{a[NR]=$1} END {for (i=NR-20; i>=1; i--) print a[i]}'); do sed -i "${l}d" "$TASKS"; done
+        echo "task $n done" ;;
+      list) grep '^- \[ \]' "$TASKS" | head -30 | awk '{printf "%2d. %s\n", NR, substr($0,7)}'; grep -q '^- \[ \]' "$TASKS" || echo "(no open tasks)" ;;
+      *) die "usage: mem task add|done|list" ;;
+    esac
+    ;;
+  stats)
+    files=$(find "$M" -name '*.md' | wc -l); lines=$(cat $(find "$M" -name '*.md') | wc -l)
+    echo "files=$files lines=$lines index=$(grep -c '^- ' "$IDX" || true)/$MAX_INDEX open_tasks=$(grep -c '^- \[ \]' "$TASKS" || true)"
+    find "$M" -name '*.md' ! -path "$M/log/*" -exec wc -l {} + | awk -v m=$MAX_FILE -v r="$M/" '$2!="total" && $1>m {sub(r,"",$2); print "over budget: " $2 " (" $1 " lines) -> consolidate"}'
+    find "$M" -name '*.md' ! -name INDEX.md ! -name tasks.md ! -path "$M/log/*" | sed "s|$M/||" | while read -r p; do
+      grep -qF "\`$p\`" "$IDX" || echo "not in index: $p -> add a line to INDEX.md"; done
+    ls "$M/log" | sort | awk '{a[NR]=$0} END {for (i=1; i<=NR-3; i++) print a[i]}' | sed 's/^/old log (can be summarized into a topic file, then deleted): log\//'
+    ;;
+  *) sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//' ;;
+esac
