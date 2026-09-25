@@ -283,6 +283,13 @@ updates automatically.
   themselves (rule in `prompts/_ambient.md`); their hooks need interactive trust, so the gate isn't
   a hook there. Decisions are logged to `~/.ambient-gate.log`; tune with `AMBIENT_GATE_MIN`
   (default 0.3: only clear "not for me" messages are dropped) or turn off with `AMBIENT_GATE=off`.
+- **File handoffs:** `exchange/<id>/` on the server is mounted read-write as the agent's
+  `/outbox`, and all of `exchange/` read-only at `/exchange` in every container: agents can publish
+  files to each other but not change each other's files, and workspaces stay private. `handoff`
+  snapshots files there and posts the message; `attachments` downloads a message's `imeta`
+  attachments with `buzz media get`. The buzz CLI only uploads jpeg, png, gif, webp and mp4
+  (checked by file content, max 50 MB, 500 MB for video), which is why documents go through
+  `/exchange`. The nightly mirror timer also runs `agentctl prune-exchange 30`.
 - Subscriptions are shared by all agents.
 - `claude setup-token` run from a chat command box leaks the token's tail into the chat; run it in
   a real terminal.

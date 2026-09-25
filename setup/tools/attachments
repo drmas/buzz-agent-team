@@ -1,0 +1,56 @@
+#!/usr/bin/env node
+// attachments — get the files attached to a Buzz message, so you can actually read them.
+//
+//   attachments --channel <uuid> --event <event-id> [--dir /workspace/inbox]
+//
+// Downloads every attachment (imeta tag: images, video, anything a human attached in Buzz Desktop)
+// with `buzz media get` into <dir>/<event-id prefix>/, and lists /exchange/… paths from teammates'
+// handoffs, which are readable in place. Prints one line per file: local path, type, size.
+'use strict';
+const { execFileSync } = require('child_process');
+const fs = require('fs');
+const path = require('path');
+
+const args = process.argv.slice(2);
+const opt = (n) => { const i = args.indexOf(`--${n}`); return i >= 0 ? args[i + 1] : undefined; };
+const die = (m) => { console.error(`attachments: ${m}`); process.exit(1); };
+const buzz = (a) => JSON.parse(execFileSync('buzz', a, { encoding: 'utf8', timeout: 60000, stdio: ['ignore', 'pipe', 'pipe'] }));
+
+const EXT = { 'image/png': 'png', 'image/jpeg': 'jpg', 'image/gif': 'gif', 'image/webp': 'webp', 'video/mp4': 'mp4',
+  'application/pdf': 'pdf', 'text/plain': 'txt', 'text/markdown': 'md', 'text/csv': 'csv', 'application/zip': 'zip', 'application/json': 'json' };
+
+function findEvent(channel, id) {
+  const list = (x) => (Array.isArray(x) ? x : x.messages || x.events || []);
+  try { const e = list(buzz(['messages', 'thread', '--channel', channel, '--event', id, '--limit', '100'])).find((x) => x.id === id); if (e) return e; } catch {}
+  return list(buzz(['messages', 'get', '--channel', channel, '--limit', '100'])).find((x) => x.id === id);
+}
+
+function main() {
+  const channel = opt('channel'), id = opt('event'), base = opt('dir') || '/workspace/inbox';
+  if (!channel || !/^[0-9a-f]{64}$/.test(id || '')) die('usage: attachments --channel <uuid> --event <event-id> [--dir /workspace/inbox]');
+  let ev;
+  try { ev = findEvent(channel, id); } catch (e) { die(`can't read the message: ${String(e.stderr || e.message).slice(0, 200)}`); }
+  if (!ev) die('message not found (is it in this channel?)');
+
+  const media = (ev.tags || []).filter((t) => t[0] === 'imeta').map((t) => Object.fromEntries(t.slice(1).map((kv) => [kv.split(' ')[0], kv.slice(kv.indexOf(' ') + 1)])));
+  const exchange = [...new Set((ev.content || '').match(/\/exchange\/[A-Za-z0-9._\/-]+/g) || [])];
+  if (!media.length && !exchange.length) return console.log('no attachments or /exchange files in this message');
+
+  const dir = path.join(base, id.slice(0, 12));
+  media.forEach((m, i) => {
+    if (!m.url) return;
+    const name = decodeURIComponent(m.url.split('/').pop().split('?')[0]) || `file-${i + 1}`;
+    const out = path.join(dir, /\.[a-z0-9]+$/i.test(name) ? name : `${name}.${EXT[m.m] || 'bin'}`);
+    try {
+      fs.mkdirSync(dir, { recursive: true });
+      execFileSync('buzz', ['media', 'get', m.url, '-o', out], { timeout: 300000, stdio: ['ignore', 'ignore', 'pipe'] });
+      console.log(`${out}  (${m.m || 'unknown type'}, ${fs.statSync(out).size} bytes)`);
+    } catch (e) { console.log(`FAILED ${m.url}: ${String(e.stderr || e.message).slice(0, 160)}`); }
+  });
+  for (const p of exchange) {
+    const clean = p.replace(/[.)]+$/, '');
+    console.log(fs.existsSync(clean) ? `${clean}  (teammate handoff, read in place)` : `MISSING ${clean} (pruned, or not a real path)`);
+  }
+}
+
+main();

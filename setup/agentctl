@@ -15,15 +15,18 @@
 #   agentctl auth <id> '<auth tag json>'   # NIP-OA owner proof (sign on your laptop: sign-owner-proofs.py)
 #   agentctl mirror [id ...]           # copy each agent's ~/memory into its Buzz memory (nightly timer)
 #   agentctl listen <id> [channel-name ...]  # channels where the agent reads every human message (none = mentions only)
+#   agentctl prune-exchange [days]     # delete handoffs older than N days (default 30; nightly timer)
 #
 # Registry: agents.list ("<id> <runtime> <mem> <kind>"); <id>.meta = display name / about.
 # Prompt sources: prompts/src/<id>.md (role), _team.md (team agents only), _turns.md, _people.md
-# (humans + company, edit by hand), _instructions.md, _delegate.md (Claude agents), _ambient.md
+# (humans + company, edit by hand), _instructions.md, _files.md, _delegate.md (Claude agents), _ambient.md
 # (Codex agents that listen). Built per agent into prompts/<id>.md (mounted read-only at /prompts)
 # with an auto-generated "Who's who" roster.
 # Model and effort live in <id>.env: ANTHROPIC_MODEL + CLAUDE_CODE_EFFORT_LEVEL (Claude) or
 # CODEX_CONFIG={"model":…,"model_reasoning_effort":…} (Codex). Claude agents also get
 # claude/managed-settings.json (ambient-gate hook) and the claude/agents/ subagents, read-only.
+# File handoffs: exchange/<id>/ is the agent's /outbox (only it can write there); the whole
+# exchange/ is mounted read-only at /exchange in every agent (see tools/handoff).
 set -euo pipefail
 DIR=/opt/buzz-agents
 cd "$DIR"
@@ -88,6 +91,7 @@ EOF
       echo "      BUZZ_ACP_NO_MEMORY: \"true\"               # file memory (~/memory, mem) replaces injected core memory"
       echo "      BUZZ_ACP_MAX_TURNS_PER_SESSION: \"40\"     # fresh context every 40 turns; memory carries continuity"
       echo "      AGENT_PUBKEY: \"$(cat "$id.pub")\"   # turn-gate: which roster row is me"
+      echo "      AGENT_ID: $id                             # handoff: /outbox is /exchange/$id for the others"
       if [ "$rt" = claude ]; then
         echo "      CLAUDE_CODE_EXECUTABLE: /usr/local/bin/claude"
         echo "      DISABLE_AUTOUPDATER: \"1\""
@@ -110,6 +114,8 @@ EOF
       echo "      - ./prompts:/prompts:ro"
       echo "      - ./rules:/rules:ro"
       echo "      - ./tools:/opt/agent-tools:ro"
+      echo "      - ./exchange:/exchange:ro          # every agent's handoffs, read-only"
+      echo "      - ./exchange/$id:/outbox           # this agent's handoffs (handoff tool)"
       for sk in skills/*/; do
         [ -d "$sk" ] || continue; sk=$(basename "$sk")
         echo "      - ./skills/$sk:/home/agent/$cfg/skills/$sk:ro"
@@ -132,6 +138,7 @@ EOF
 # it, and seed the team-editable instructions file.
 prep_home() {  # id runtime
   local cfg file
+  install -d -m 755 exchange; install -d -m 755 -o 1000 -g 1000 "exchange/$1"
   if [ "$2" = claude ]; then cfg=.claude; file=CLAUDE.md; else cfg=.codex; file=AGENTS.md; fi
   docker run --rm -v "buzz-agents_$1-home:/h" -v "$DIR/instructions-header.md:/header.md:ro" \
     -e CFG="$cfg" -e FILE="$file" alpine sh -c '
@@ -174,6 +181,7 @@ build_prompts() {
       [ -f "prompts/src/$id.md" ] && { cat "prompts/src/$id.md"; echo; }
       [ "${kind:-team}" = team ] && [ -f prompts/src/_team.md ] && { cat prompts/src/_team.md; echo; }
       [ -f prompts/src/_turns.md ] && { cat prompts/src/_turns.md; echo; }
+      [ -f prompts/src/_files.md ] && { cat prompts/src/_files.md; echo; }
       [ "$rt" = claude ] && [ -f prompts/src/_delegate.md ] && { cat prompts/src/_delegate.md; echo; }
       [ "$rt" = codex ] && [ -s "$id.listen" ] && [ -f prompts/src/_ambient.md ] && { cat prompts/src/_ambient.md; echo; }
       cat prompts/_roster.md; echo
@@ -397,6 +405,10 @@ case "$cmd" in
     [[ "$t" =~ ^\[\"auth\",\"[0-9a-f]{64}\",\"[^\"]*\",\"[0-9a-f]{128}\"\]$ ]] || die "not an auth tag"
     sed -i '/^BUZZ_AUTH_TAG=/d' "$id.env"; echo "BUZZ_AUTH_TAG=$t" >> "$id.env"
     echo "$id: owner proof set (restart to apply)" ;;
+  prune-exchange)
+    days=${1:-30}; [[ "$days" =~ ^[0-9]+$ ]] || die "days must be a number"
+    [ -d exchange ] || exit 0
+    find exchange -mindepth 2 -maxdepth 2 -mtime +"$days" -print -exec rm -rf {} + | sed 's/^/pruned /' ;;
   build) build_prompts ;;
   prep-all) while read -r i r _; do [ -n "${i:-}" ] && prep_home "$i" "$r"; done < agents.list; render ;;
   *) die "unknown command $cmd" ;;

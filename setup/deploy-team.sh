@@ -28,6 +28,9 @@ cat >> refresh-secrets.sh <<'EOF'
 k=\$(get /buzz/typesafe-api-key); if [ -n "\$k" ]; then printf 'TYPESAFE_API_KEY=%s\\n' "\$k" > secrets/common.env; echo "typesafe: API key loaded"; else rm -f secrets/common.env; fi
 EOF
 ./refresh-secrets.sh | grep typesafe || echo "typesafe: no /buzz/typesafe-api-key (turn-gate stays off)"
+# nightly timer: also prune file handoffs older than 30 days (servers set up before handoffs existed)
+f=/etc/systemd/system/buzz-memory-mirror.service
+if [ -f \$f ] && ! grep -q prune-exchange \$f; then sed -i '/agentctl mirror\$/a ExecStart=/opt/buzz-agents/agentctl prune-exchange 30' \$f; systemctl daemon-reload; echo "mirror timer: + prune-exchange"; fi
 printf '%s\n' "\$OWNER_NAME" > owner.name   # exported by ssm-run.sh from config.env
 [ -f owner.hex ] || sed -n 's/^BUZZ_ACP_AGENT_OWNER=//p' claude.env > owner.hex
 [ -f agents.list ] || printf 'claude claude 3g solo\ncodex codex 3g solo\n' > agents.list

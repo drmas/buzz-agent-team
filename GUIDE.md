@@ -108,6 +108,8 @@ If it doesn't see them, check `buzz-team logs pm` for errors after the restart.
 | `~/memory` | Its long-term memory (use the `mem` command: `mem stats`, `mem find <word>`) |
 | `~/.claude/CLAUDE.md` or `~/.codex/AGENTS.md` | Its team-editable standing instructions |
 | `/prompts/<agent>.md` | Its base role and the team roster (read-only) |
+| `/outbox` | Files it has handed off (only it can write here) |
+| `/exchange/<agent>/` | Every agent's handoffs (read-only) |
 
 Everything else in the container is read-only by design.
 
@@ -151,6 +153,28 @@ Claude agents can also switch models within a single task through two subagents:
 The agents decide when to delegate (rule in `prompts/_delegate.md`). You can also ask directly:
 "@PM use deep-work to write the full spec".
 
+## Files between agents
+
+Each agent's `/workspace` is private. To pass files, agents use `handoff`, which copies them into
+a snapshot every agent can read (read-only) and posts one message with the mentions and the file
+list:
+
+```bash
+handoff --channel <uuid> --reply-to <event> --to Engineer --file spec.md --file flow.png \
+  --message "Build the toggle from spec.md. Done = PR with tests. Reply in this thread."
+```
+
+- Files land in `/exchange/<sender>/<timestamp>-<slug>/`. Every agent can read them there; only
+  the sender can write to its own `/outbox`.
+- Any file type works. Images and mp4s are also attached in Buzz so humans see them: Buzz
+  uploads accept only jpeg, png, gif, webp and mp4.
+- When a message has attachments, agents run `attachments --channel <uuid> --event <id>`, which
+  downloads them to `/workspace/inbox/<event>/` and checks any `/exchange` paths.
+- Humans can't open `/exchange` from Buzz Desktop. Agents give humans short text inline, images
+  as attachments, and long markdown as a Buzz note (`buzz notes set`). To look at a handoff
+  yourself: `buzz-team shell <agent>`, then `ls /exchange`.
+- Handoffs older than 30 days are deleted nightly (`agentctl prune-exchange [days]` to run it by hand).
+
 ## Ambient gate: fewer wasted turns
 
 Agents read every human message in their channels, but most need no reply. Before the main model
@@ -184,6 +208,7 @@ agentctl runtime engineer codex && agentctl login-codex engineer
 | `agentctl respond-to <agent> owner-only\|anyone` | Who it answers |
 | `agentctl sync` | Rebuild instructions and roster, restart changed agents |
 | `agentctl mirror` | Copy memory into Buzz now (it also runs nightly at 02:00 UTC) |
+| `agentctl prune-exchange [days]` | Delete file handoffs older than N days (default 30; also nightly) |
 
 The people/company section of the roster is `/opt/buzz-agents/prompts/src/_people.md`; after
 editing it, run `agentctl sync`. (Better: edit `setup/prompts/_people.md` and run
@@ -201,5 +226,6 @@ editing it, run `agentctl sync`. (Better: edit `setup/prompts/_people.md` and ru
 | Agents still answer on top of each other | Check `~/.turn-gate.log` in each: `gate off (no TYPESAFE_API_KEY)` means the key isn't loaded (`./deploy-team.sh`) |
 | Second agent is too slow | Lower `STEP` / `MAX_WAIT` at the top of `setup/tools/turn-gate`, then `./deploy-team.sh` |
 | Second agent repeats the first one | The first reply took longer than `STEP` (60 s); raise it in `setup/tools/turn-gate` |
+| Agent says it can't open another agent's file | The sender pointed at its own `/workspace`; ask it to resend with `handoff` |
 | Agent ignores a message it should have answered | Check `~/.ambient-gate.log` for a `SKIP`; mention the agent, or lower `AMBIENT_GATE_MIN` |
 | Agent answers too slowly or too shallowly | `agentctl model <agent> …` (lower effort for speed, `opus`/higher effort for depth) |

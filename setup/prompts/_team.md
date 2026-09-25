@@ -16,9 +16,9 @@ everyone (humans and agents), what they own, and how to mention them.
   ("Decision needed: …") instead of assuming.
 - Ask at most one or two clarifying questions when a request is ambiguous; otherwise state
   your assumptions and proceed.
-- Keep chat replies short and scannable. Put long deliverables (specs, copy decks, mockups,
-  code) in files in your workspace and summarize them in the channel, or post them in a
-  thread reply so the channel stays readable.
+- Keep chat replies short and scannable. Share long deliverables (specs, copy decks, mockups,
+  code) as files (see "Sharing files and handing off work") and summarize them in the thread,
+  so the channel stays readable.
 - Reply in the thread where you were asked.
 - Be honest about uncertainty and never invent facts, metrics, customers or quotes.
 

@@ -28,6 +28,10 @@ and the docs we use to run it. Fork it, fill in `setup/config.env`, and follow `
 - **Cheap ambient listening.** Before an agent's main model sees a channel message it wasn't
   mentioned in, `ambient-gate` asks a fast model whether the message is for it. Messages that
   clearly aren't cost nothing.
+- **File handoffs between agents.** Workspaces are private, so agents hand files over with
+  `handoff`: a read-only snapshot every agent can open at `/exchange/<agent>/…`, plus one Buzz
+  message with real mentions and the file list (images also attached in Buzz). `attachments`
+  downloads whatever a human attached to a message. Any file type; old handoffs are pruned nightly.
 - **Cheap long-term memory.** Plain files in `~/memory` behind a token-frugal `mem` command,
   mirrored nightly into Buzz so you can read them in Buzz Desktop.
 - **Team-editable instructions.** Anyone can tell an agent "from now on…" and it updates its own
@@ -69,7 +73,7 @@ Your laptop                            agentctl (manage agents), systemd units
 | `setup/agentctl` | Server-side CLI: add/remove agents, prompts, listening, profiles, memory mirror |
 | `setup/deploy-team.sh` | Ship agentctl, prompts, skills and tools; create team agents; restart what changed |
 | `setup/prompts/` | Role prompts, team rules (`_team.md`), turn-taking rule (`_turns.md`), people |
-| `setup/tools/` | `mem`, `mem-mirror`, `turn-gate`, `ambient-gate` (on every agent's PATH) |
+| `setup/tools/` | `mem`, `mem-mirror`, `turn-gate`, `ambient-gate`, `handoff`, `attachments` (on every agent's PATH) |
 | `setup/claude/` | Claude agents' managed settings (ambient-gate hook) and subagents (`deep-work`, `scout`) |
 | `setup/skills/` | `memory`, `update-instructions` |
 | `setup/sign-owner-proofs.py`, `publish-owner-records.py`, `share-assistants.sh` | Make Buzz show the agents as your shared assistants |

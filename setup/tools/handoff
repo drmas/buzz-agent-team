@@ -1,0 +1,137 @@
+#!/usr/bin/env node
+// handoff — hand files (and a brief) to teammates in one Buzz message.
+//
+//   handoff --channel <uuid> [--reply-to <event-id>] --to <Name|pubkey> [--to …] \
+//           [--file <path> …] [--title "Dark mode spec"] --message <text | - for stdin>
+//
+// Each agent's workspace is private, so a path like /workspace/spec.md means nothing to anyone
+// else. handoff copies the files into this agent's /outbox (a fixed snapshot: later edits don't
+// change what was handed over), which every other agent can read at /exchange/<agent-id>/…, then
+// posts the brief with real mentions and the list of files. Images and mp4 videos are also
+// attached through Buzz, so humans see them in the thread. Any file type works; Buzz uploads alone
+// only take images and video.
+//
+// Humans can't open /exchange paths: for them, inline short text, attach images, or publish long
+// markdown with `buzz notes set`. Env: AGENT_ID, HANDOFF_MAX_MB (total size cap, default 200).
+'use strict';
+const { execFileSync } = require('child_process');
+const fs = require('fs');
+const path = require('path');
+
+const ROSTER = process.env.TURN_GATE_ROSTER || '/prompts/_roster.md';
+const OUTBOX = process.env.HANDOFF_OUTBOX || '/outbox';
+const MAX_MB = +(process.env.HANDOFF_MAX_MB || 200);
+
+const args = process.argv.slice(2);
+const opt = (n) => { const i = args.indexOf(`--${n}`); return i >= 0 ? args[i + 1] : undefined; };
+const all = (n) => args.flatMap((a, i) => (a === `--${n}` && args[i + 1] !== undefined ? [args[i + 1]] : []));
+const die = (m) => { console.error(`handoff: ${m}`); process.exit(1); };
+
+// Agents from the generated "Who's who" table: | Name | `pubkey` | … |
+function roster() {
+  const out = {};
+  try {
+    for (const line of fs.readFileSync(ROSTER, 'utf8').split('\n')) {
+      const m = line.match(/^\| (.+?) \| `([0-9a-f]{64})` \|/);
+      if (m) out[m[1].toLowerCase()] = { name: m[1], pubkey: m[2], agent: true };
+    }
+  } catch {}
+  return out;
+}
+
+function resolve(who, agents) {
+  const w = who.replace(/^@/, '');
+  if (/^[0-9a-f]{64}$/.test(w) || /^npub1[0-9a-z]+$/.test(w)) {
+    const a = Object.values(agents).find((x) => x.pubkey === w);
+    return a || { name: w.slice(0, 12), pubkey: w, agent: false };
+  }
+  if (agents[w.toLowerCase()]) return agents[w.toLowerCase()];
+  // A human: look them up by display name.
+  let users;
+  try {
+    users = JSON.parse(execFileSync('buzz', ['users', 'get', '--name', w], { encoding: 'utf8', timeout: 30000, stdio: ['ignore', 'pipe', 'pipe'] }));
+  } catch (e) { die(`can't look up "${w}": ${String(e.stderr || e.message).slice(0, 200)}`); }
+  const list = (Array.isArray(users) ? users : [users]).filter(Boolean);
+  const name = (u) => u.display_name || u.name || u.displayName || '';
+  const exact = list.filter((u) => name(u).toLowerCase() === w.toLowerCase());
+  const pick = exact.length === 1 ? exact[0] : list.length === 1 ? list[0] : null;
+  if (!pick || !/^[0-9a-f]{64}$/.test(pick.pubkey || '')) die(`"${w}" matches ${list.length} people; pass their pubkey instead`);
+  return { name: name(pick) || w, pubkey: pick.pubkey, agent: false };
+}
+
+// Buzz only accepts these for upload (checked by magic bytes, as the buzz CLI does).
+function buzzMedia(file) {
+  const fd = fs.openSync(file, 'r'); const b = Buffer.alloc(12); fs.readSync(fd, b, 0, 12, 0); fs.closeSync(fd);
+  if (b.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))) return true;  // png
+  if (b[0] === 0xff && b[1] === 0xd8 && b[2] === 0xff) return true;                                          // jpeg
+  if (b.subarray(0, 4).toString() === 'GIF8') return true;                                                   // gif
+  if (b.subarray(0, 4).toString() === 'RIFF' && b.subarray(8, 12).toString() === 'WEBP') return true;        // webp
+  if (b.subarray(4, 8).toString() === 'ftyp') return /\.mp4$/i.test(file);                                   // mp4
+  return false;
+}
+
+const size = (n) => (n < 1024 ? `${n} B` : n < 1048576 ? `${(n / 1024).toFixed(1)} KB` : `${(n / 1048576).toFixed(1)} MB`);
+function du(p) {
+  const st = fs.statSync(p);
+  return st.isDirectory() ? fs.readdirSync(p).reduce((t, f) => t + du(path.join(p, f)), 0) : st.size;
+}
+
+function main() {
+  const channel = opt('channel'), replyTo = opt('reply-to'), title = opt('title');
+  const files = all('file'), to = all('to');
+  if (!channel || !to.length) die('usage: handoff --channel <uuid> [--reply-to <event>] --to <Name|pubkey> [--to …] [--file <path> …] [--title T] --message <text|->');
+  const me = process.env.AGENT_ID;
+  if (!me || !fs.existsSync(OUTBOX)) die('no /outbox here (this container has no handoff exchange)');
+  const msg = opt('message');
+  const brief = (msg === '-' ? fs.readFileSync(0, 'utf8') : msg || '').trim();
+  if (!brief) die('--message is empty: say what you need, the context, what "done" looks like, and where to reply');
+
+  const agents = roster();
+  const people = to.map((w) => resolve(w, agents));
+
+  // Snapshot the files into /outbox/<timestamp>-<slug>/.
+  let dir = null, listed = [], media = [];
+  if (files.length) {
+    for (const f of files) if (!fs.existsSync(f)) die(`no such file: ${f}`);
+    const total = files.reduce((t, f) => t + du(f), 0);
+    if (total > MAX_MB * 1048576) die(`files total ${size(total)}, over the ${MAX_MB} MB limit (HANDOFF_MAX_MB)`);
+    const slug = (title || path.basename(files[0])).toLowerCase().replace(/\.[a-z0-9]+$/, '').replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 40) || 'files';
+    const stamp = new Date().toISOString().replace(/[-:]/g, '').replace('T', '-').slice(0, 15);
+    dir = `${stamp}-${slug}`;
+    for (let n = 2; fs.existsSync(path.join(OUTBOX, dir)); n++) dir = `${stamp}-${slug}-${n}`;
+    fs.mkdirSync(path.join(OUTBOX, dir));
+    for (const f of files) {
+      const dest = path.join(OUTBOX, dir, path.basename(f));
+      if (fs.existsSync(dest)) die(`two files named ${path.basename(f)}; rename one`);
+      fs.cpSync(f, dest, { recursive: true });
+      const isDir = fs.statSync(dest).isDirectory();
+      listed.push(`- ${path.basename(f)}${isDir ? '/' : ''} (${size(du(dest))})`);
+      if (!isDir && buzzMedia(dest)) media.push(dest);
+    }
+  }
+
+  const tags = people.filter((p) => !new RegExp(`@${p.name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i').test(brief)).map((p) => `@${p.name}`);
+  let content = `${tags.length ? tags.join(' ') + ' ' : ''}${brief}`;
+  if (dir) content += `\n\n**Files** (read-only for every agent at \`/exchange/${me}/${dir}/\`):\n${listed.join('\n')}`;
+
+  const cmd = ['messages', 'send', '--channel', channel, '--content', '-'];
+  if (replyTo) cmd.push('--reply-to', replyTo);
+  for (const p of people) cmd.push('--mention', p.pubkey);
+  for (const m of media) cmd.push('--file', m);
+  let out;
+  try {
+    out = execFileSync('buzz', cmd, { input: content, encoding: 'utf8', timeout: 180000, stdio: ['pipe', 'pipe', 'pipe'] });
+  } catch (e) {
+    die(`buzz messages send failed: ${String(e.stderr || e.message).slice(0, 400)}${dir ? ` (files are still at /exchange/${me}/${dir}/)` : ''}`);
+  }
+  let id = '';
+  try { const j = JSON.parse(out); id = j.event_id || j.id || ''; } catch {}
+  console.log(`sent${id ? ` ${id}` : ''} to ${people.map((p) => p.name).join(', ')}`);
+  if (dir) console.log(`files: /exchange/${me}/${dir}/ (${listed.length}${media.length ? `, ${media.length} also attached in Buzz` : ''})`);
+  const humans = people.filter((p) => !p.agent);
+  if (humans.length && dir && media.length < listed.length) {
+    console.log(`note: ${humans.map((p) => p.name).join(', ')} can't open /exchange paths. Inline short text, or publish long markdown with \`buzz notes set\` and link it.`);
+  }
+}
+
+main();
