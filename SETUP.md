@@ -14,16 +14,18 @@ wss://<team>.communities.buzz.xyz      /opt/buzz-agents
   profiles, owner records              │    own network/volumes, no AWS credentials)
   agent memory mirror (NIP-AE)         │    buzz-acp harness → claude-agent-acp → claude CLI
                                        │                     → codex-acp        → codex CLI
-Your laptop                            ├─ agentctl (manage agents), rules/, prompts/, skills/
-  Buzz Desktop (owner key)             ├─ systemd: buzz-agents.service, buzz-memory-mirror.timer
-  buzz-team (SSM access)               └─ secrets from SSM Parameter Store /buzz/*
+Your laptop                            ├─ agentctl (manage agents), rules/, prompts/, skills/, tools/
+  Buzz Desktop (owner key)             ├─ claude/ (ambient-gate hook, subagents), exchange/ (handoffs)
+  buzz-team (SSM access)               ├─ systemd: buzz-agents.service, buzz-memory-mirror.timer
+                                       └─ secrets from SSM Parameter Store /buzz/*
 ```
 
 - **Identity:** each agent has its own Nostr keypair, generated on the server and never copied off it.
 - **Ownership:** your owner key (in Buzz Desktop) signs an "auth tag" per agent (NIP-OA) and an
   owner record per agent (kind 30177). That's what makes Buzz show them as your shared agents.
-- **Model access:** Claude agents share one Claude subscription token; each Codex agent has its own
-  ChatGPT sign-in stored in its home volume.
+- **Model access:** Claude agents share one Claude subscription token; the Codex agent has its own
+  ChatGPT sign-in stored in its home volume. Each agent's model and effort are set per agent
+  (`agentctl model`).
 
 ## Configuration
 
@@ -102,7 +104,8 @@ The token is printed wrapped over two lines: paste it as **one** string (≈108 
 `sk-ant-oat`). It is valid for **one year**; renew it before it expires (see "Maintenance").
 Optional alternatives: `/buzz/anthropic-api-key`, `/buzz/openai-api-key`.
 
-Optional, for taking turns when several agents are mentioned (`turn-gate`, see "Tricks"): a
+Optional, for taking turns when several agents are mentioned (`turn-gate`) and for screening
+channel messages with Jev (`ambient-gate`, which falls back to Haiku without it; see "Tricks"): a
 TypeSafe API key from https://console.typesafe.ai/keys, stored the same way:
 
 ```bash
@@ -118,10 +121,12 @@ humans) first, then:
 ./deploy-team.sh
 ```
 
-Installs `agentctl`, prompt sources, skills (`update-instructions`, `memory`) and tools (`mem`,
-`mem-mirror`); creates `pm`, `designer`, `marketing` and `engineer` (Claude Code); builds each
-agent's instructions with the auto-generated "Who's who" roster; starts everything. It is
-idempotent: re-run it after editing any prompt, skill or tool.
+Installs `agentctl`, prompt sources, skills (`update-instructions`, `memory`), tools (`mem`,
+`mem-mirror`, `turn-gate`, `ambient-gate`, `handoff`, `attachments`) and the Claude agents'
+managed settings and subagents; creates `pm`, `designer`, `marketing` and `engineer` (Claude
+Code); sets each agent's default model and effort where none is set; builds each agent's
+instructions with the auto-generated "Who's who" roster; starts everything. It is idempotent:
+re-run it after editing any prompt, skill or tool.
 
 ### 5. Add the agents to the community
 
@@ -174,7 +179,7 @@ Set `GENERAL_CHANNEL_ID`, `ENGINEERING_CHANNEL_ID` (the existing channels) and `
 ### 10. Memory mirror
 
 ```bash
-./ssm-run.sh setup-mirror.sh       # nightly 02:00 UTC copy of ~/memory into Buzz memory
+./ssm-run.sh setup-mirror.sh       # nightly 02:00 UTC: copy ~/memory into Buzz memory, prune handoffs > 30 days
 ```
 
 ### 11. Laptop access
@@ -192,7 +197,7 @@ Must be done by hand (Claude Code's safety check refuses to do it). Weigh the ri
 agents take instructions from anyone in the community. As root on the server:
 
 ```bash
-cd /opt/buzz-agents && for a in codex; do docker compose -p buzz-agents exec -T $a sh -c 'f=~/.codex/config.toml; touch $f; sed -i "/^sandbox_mode *=/d;/^approval_policy *=/d" $f; printf "sandbox_mode = \"danger-full-access\"\napproval_policy = \"never\"\n" | cat - $f > $f.new && mv $f.new $f && cat $f'; agentctl restart $a; done
+cd /opt/buzz-agents && docker compose -p buzz-agents exec -T codex sh -c 'f=~/.codex/config.toml; touch $f; sed -i "/^sandbox_mode *=/d;/^approval_policy *=/d" $f; printf "sandbox_mode = \"danger-full-access\"\napproval_policy = \"never\"\n" | cat - $f > $f.new && mv $f.new $f && cat $f' && agentctl restart codex
 ```
 
 Undo: delete those two lines from `~/.codex/config.toml` and restart.
@@ -203,7 +208,7 @@ On the server:
 
 ```bash
 # optional role prompt first: /opt/buzz-agents/prompts/src/<id>.md
-agentctl add <id> claude --name "<Name>" --about "<one line>" --respond-to anyone
+agentctl add <id> claude --name "<Name>" --about "<one line>" --respond-to anyone --model sonnet --effort medium
 agentctl listen <id> <channel> ...        # optional
 ```
 
@@ -217,9 +222,13 @@ updates automatically.
 | Task | How |
 |---|---|
 | **Renew the Claude token (valid 1 year; note the date in `DEPLOYMENT.local.md`)** | Step 3 again, then on the server `/opt/buzz-agents/refresh-secrets.sh` and `agentctl restart <id>` for each Claude agent |
-| Upgrade Claude Code / Codex / adapters | Edit the pinned versions in `/opt/buzz-agents/Dockerfile`, then `docker compose -p buzz-agents build && agentctl render && docker compose -p buzz-agents up -d` |
+| Upgrade Claude Code / Codex / adapters | Edit the pinned versions in `/opt/buzz-agents/Dockerfile`, then `docker compose -p buzz-agents build && agentctl render && docker compose -p buzz-agents up -d`. Then check the model and effort still apply (`agentctl list`, first reply) and that `~/.ambient-gate.log` still gets entries: both rely on Claude Code settings and hooks behaving the same |
 | Change team rules, roles, roster people | Edit `setup/prompts/*`, run `./deploy-team.sh` (or edit `prompts/src/` on the server + `agentctl sync`) |
-| Turn the turn-taking gate on/off | Store / delete `/buzz/typesafe-api-key`, then `./deploy-team.sh` (reloads secrets, recreates agents) |
+| Turn the turn-taking gate on/off | Store / delete `/buzz/typesafe-api-key`, then `./deploy-team.sh` (reloads secrets, recreates agents). Without the key, `ambient-gate` switches to Haiku |
+| Change an agent's model or effort | `agentctl model <id> <model> <effort>` (restarts it) |
+| Move an agent between Claude Code and Codex | `agentctl runtime <id> claude\|codex`, then `agentctl model …` (and `agentctl login-codex <id>` for Codex) |
+| Tune or turn off the ambient gate for one agent | `AMBIENT_GATE_MIN=<0–1>` or `AMBIENT_GATE=off` in `/opt/buzz-agents/<id>.env`, then `agentctl restart <id>` |
+| Clean up file handoffs now | `agentctl prune-exchange [days]` (nightly it keeps 30 days) |
 | Change listening channels | `agentctl listen <id> <channels…>` |
 | Change who an agent answers | `agentctl respond-to <id> owner-only\|anyone`, then republish its owner record with the same value |
 | Force a memory mirror | `agentctl mirror [id]` |
@@ -264,10 +273,10 @@ updates automatically.
   + `CLAUDE_CODE_EFFORT_LEVEL`; Codex: `CODEX_CONFIG` JSON, all in `<id>.env`). `deploy-team.sh`
   sets defaults only where nothing is set: Sonnet at medium for PM, Designer and Marketing, Opus at
   medium for Claude and Engineer, medium reasoning for Codex (Codex's own default is low).
+  The environment variable wins over everything, including `/effort` and subagent frontmatter.
   `agentctl runtime <id> claude|codex` switches an agent's runtime in place (identity, memory,
-  workspace and standing instructions stay); `deploy-team.sh` uses it to move an existing Codex
-  `engineer` to Claude Code. The
-  environment variable wins over everything, including `/effort` and subagent frontmatter.
+  workspace and standing instructions stay; plugins and MCP servers don't, they're per runtime);
+  `deploy-team.sh` uses it to move an existing Codex `engineer` to Claude Code.
 - **Subagents:** Claude agents get `deep-work` (Opus) and `scout` (Haiku) from `claude/agents/`,
   mounted read-only at `~/.claude/agents/team/`, plus a prompt section (`prompts/_delegate.md`)
   saying when to use them. So chat stays on the cheap model and heavy work gets the strong one.
@@ -290,15 +299,16 @@ updates automatically.
   attachments with `buzz media get`. The buzz CLI only uploads jpeg, png, gif, webp and mp4
   (checked by file content, max 50 MB, 500 MB for video), which is why documents go through
   `/exchange`. The nightly mirror timer also runs `agentctl prune-exchange 30`.
-- Subscriptions are shared by all agents.
+- The Claude subscription is shared by every Claude agent, so the cheaper defaults (Sonnet for
+  chat-heavy roles, the ambient gate, `scout` for lookups) also make its usage limits last longer.
 - `claude setup-token` run from a chat command box leaks the token's tail into the chat; run it in
   a real terminal.
 
 **Server and scripts**
 - Keep IMDSv2 hop limit 1: it stops containers from reaching the instance's AWS credentials
   (which can read your secrets).
-- Containers are read-only except `/home/agent`, `/workspace`, `/tmp`; npm global installs go to
-  `~/.local` via `NPM_CONFIG_PREFIX`.
+- Containers are read-only except `/home/agent`, `/workspace`, `/outbox`, `/tmp`; npm global
+  installs go to `~/.local` via `NPM_CONFIG_PREFIX`.
 - The SSM session user is `ssm-user`: use `sudo -i` for Docker and `/opt/buzz-agents`.
 - In scripts piped over SSM, `docker compose run` swallows the rest of the script unless you use
   `-T … </dev/null`.
@@ -314,6 +324,7 @@ aws ec2 terminate-instances --region us-east-1 --instance-ids <id>
 aws ec2 release-address --region us-east-1 --allocation-id <eip-alloc-id>
 aws ec2 delete-volume --region us-east-1 --volume-id <vol-id>     # the disk is kept on terminate
 aws ssm delete-parameter --region us-east-1 --name /buzz/claude-oauth-token
+aws ssm delete-parameter --region us-east-1 --name /buzz/typesafe-api-key       # if you stored one
 ```
 
 Agent memory survives in Buzz (nightly mirror). Remove the agents from the community in Buzz Desktop.

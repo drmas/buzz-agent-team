@@ -21,7 +21,8 @@ Default models: Sonnet (medium effort) for PM, Designer and Marketing; Opus (med
 and `engineer`; Codex's default model at medium reasoning for `codex`. See "Models and effort" below.
 
 All of them answer anyone in the community when mentioned. Only the owner can DM them.
-When one message mentions several of them, they take turns (see "Taking turns" below).
+When one message mentions several of them, they take turns (see "Taking turns" below). They pass
+files to each other with `handoff` (see "Files between agents").
 
 ## Prerequisites (on your laptop)
 
@@ -110,6 +111,9 @@ If it doesn't see them, check `buzz-team logs pm` for errors after the restart.
 | `/prompts/<agent>.md` | Its base role and the team roster (read-only) |
 | `/outbox` | Files it has handed off (only it can write here) |
 | `/exchange/<agent>/` | Every agent's handoffs (read-only) |
+| `/workspace/inbox/<event>/` | Attachments it downloaded from Buzz messages |
+| `~/.claude/agents/team/` | The `deep-work` and `scout` subagents (Claude agents, read-only) |
+| `~/.turn-gate.log`, `~/.ambient-gate.log` | Every turn-taking and ambient-gate decision |
 
 Everything else in the container is read-only by design.
 
@@ -125,9 +129,10 @@ TypeSafe's Jev model (https://docs.typesafe.ai) who should go first:
 | `REPLY-AFTER` | waited for the agents ahead of it, then adds only what's new or answers what they asked it |
 | `SKIP` | waited, and the others already covered its part, so it says nothing |
 
-Expect the second agent to answer a minute or two after the first. Every decision, with Jev's
-probabilities, is logged in the agent's `~/.turn-gate.log` (`buzz-team shell pm`, then
-`tail ~/.turn-gate.log`). No TypeSafe key, or any error, means `REPLY`: the old behaviour.
+Expect the second agent to answer within a minute or two of the first (it waits up to 60 s per
+agent ahead of it, 180 s at most). Every decision, with Jev's probabilities, is logged in the
+agent's `~/.turn-gate.log` (`buzz-team shell pm`, then `tail ~/.turn-gate.log`). No TypeSafe key,
+or any error, means `REPLY`: the old behaviour.
 
 ## Models and effort
 
@@ -152,6 +157,16 @@ Claude agents can also switch models within a single task through two subagents:
 
 The agents decide when to delegate (rule in `prompts/_delegate.md`). You can also ask directly:
 "@PM use deep-work to write the full spec".
+
+To move an agent between Claude Code and Codex (keeps its Buzz identity, memory, workspace and
+standing instructions; set its model again afterwards, and reinstall any plugins or MCP servers,
+since those are per runtime):
+
+```bash
+agentctl runtime engineer codex && agentctl login-codex engineer
+```
+
+`engineer` ran on Codex until it was moved to Claude Code with `agentctl runtime engineer claude`.
 
 ## Files between agents
 
@@ -189,12 +204,9 @@ tail ~/.ambient-gate.log
 grep -c '"SKIP"' ~/.ambient-gate.log    # turns saved
 ```
 
-To move an agent between Claude Code and Codex (keeps its Buzz identity, memory, workspace and
-standing instructions; set its model again afterwards):
-
-```bash
-agentctl runtime engineer codex && agentctl login-codex engineer
-```
+To make the gate more or less strict for one agent, add `AMBIENT_GATE_MIN=0.15` (lets more
+through; default 0.3) or `AMBIENT_GATE=off` to `/opt/buzz-agents/<agent>.env` on the server, then
+`agentctl restart <agent>`.
 
 ## On the server (as root, `buzz-team server`)
 
@@ -227,5 +239,5 @@ editing it, run `agentctl sync`. (Better: edit `setup/prompts/_people.md` and ru
 | Second agent is too slow | Lower `STEP` / `MAX_WAIT` at the top of `setup/tools/turn-gate`, then `./deploy-team.sh` |
 | Second agent repeats the first one | The first reply took longer than `STEP` (60 s); raise it in `setup/tools/turn-gate` |
 | Agent says it can't open another agent's file | The sender pointed at its own `/workspace`; ask it to resend with `handoff` |
-| Agent ignores a message it should have answered | Check `~/.ambient-gate.log` for a `SKIP`; mention the agent, or lower `AMBIENT_GATE_MIN` |
+| Agent ignores a message it should have answered | Check `~/.ambient-gate.log` for a `SKIP`; mention the agent, or lower `AMBIENT_GATE_MIN` (see "Ambient gate") |
 | Agent answers too slowly or too shallowly | `agentctl model <agent> …` (lower effort for speed, `opus`/higher effort for depth) |
