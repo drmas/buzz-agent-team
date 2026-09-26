@@ -1,0 +1,215 @@
+#!/usr/bin/env node
+// proof — capture evidence that a feature works, to attach to the message that reports it.
+//
+//   proof shot  <url|file> [--script flow.mjs] [--full] [--wait <selector>]   screenshot (PNG)
+//   proof video <url|file> [--script flow.mjs] [--seconds 5]                  screen recording (MP4)
+//   proof term  [--title <text>] [--lines 60] -- <command …>                   runs the command, PNG of its output
+//
+// Common: --out <file> (default /workspace/proof/<time>-<kind>.<ext>), --size 1280x720, --dark.
+//
+// A flow script drives the page while it's recorded, with captions so a viewer can follow along:
+//
+//   export default async ({ page, step, snap }) => {
+//     await step('Open settings');                  // caption shown on the page (and in the video)
+//     await page.getByRole('link', { name: 'Settings' }).click();
+//     await step('Turn on dark mode');
+//     await page.getByLabel('Dark mode').check();
+//     await snap('dark-mode-on');                    // extra screenshot next to --out
+//   };
+//
+// `page` is a Playwright page (https://playwright.dev/docs/api/class-page). Prints the files written,
+// plus console errors and failed requests seen on the page. Uses headless Chromium ($CHROME_BIN),
+// playwright-core and ffmpeg from the image.
+'use strict';
+const { spawn, spawnSync } = require('child_process');
+const fs = require('fs');
+const path = require('path');
+const { pathToFileURL } = require('url');
+
+const argv = process.argv.slice(2);
+const dash = argv.indexOf('--');
+const args = dash >= 0 ? argv.slice(0, dash) : argv;
+const cmd = dash >= 0 ? argv.slice(dash + 1) : [];
+const opt = (n) => { const i = args.indexOf(`--${n}`); return i >= 0 ? args[i + 1] : undefined; };
+const flag = (n) => args.includes(`--${n}`);
+const die = (m) => { console.error(`proof: ${m}`); process.exit(1); };
+const kind = args[0];
+const target = args[1] && !args[1].startsWith('--') ? args[1] : undefined;
+
+const [W, H] = (opt('size') || '1280x720').split('x').map(Number);
+const FPS = 10, MAX_SECONDS = 180;
+const EXT = { shot: 'png', video: 'mp4', term: 'png' };
+
+function playwright() {
+  for (const p of ['playwright-core', '/usr/local/lib/node_modules/playwright-core', '/usr/lib/node_modules/playwright-core']) {
+    try { return require(p); } catch {}
+  }
+  die('playwright-core is not installed in this image');
+}
+
+function outPath() {
+  const out = opt('out') || path.join(fs.existsSync('/workspace') ? '/workspace/proof' : 'proof',
+    `${new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)}-${kind}.${EXT[kind]}`);
+  fs.mkdirSync(path.dirname(path.resolve(out)), { recursive: true });
+  return path.resolve(out);
+}
+
+const toUrl = (t) => (/^[a-z]+:\/\//i.test(t) ? t : pathToFileURL(path.resolve(t)).href);
+
+async function browser() {
+  const { chromium } = playwright();
+  const b = await chromium.launch({ executablePath: process.env.CHROME_BIN || '/usr/bin/chromium-browser' });
+  const ctx = await b.newContext({ viewport: { width: W, height: H }, colorScheme: flag('dark') ? 'dark' : 'light' });
+  const page = await ctx.newPage();
+  const problems = [];
+  page.on('console', (m) => { if (m.type() === 'error') problems.push(`console error: ${m.text().slice(0, 200)}`); });
+  page.on('pageerror', (e) => problems.push(`page error: ${String(e.message || e).slice(0, 200)}`));
+  page.on('requestfailed', (r) => problems.push(`request failed: ${r.url().slice(0, 150)} (${r.failure()?.errorText})`));
+  page.on('response', (r) => { if (r.status() >= 500) problems.push(`HTTP ${r.status()}: ${r.url().slice(0, 150)}`); });
+  return { b, ctx, page, problems };
+}
+
+// Caption bar at the bottom of the page, so each step is readable in the video and screenshots.
+async function caption(page, text) {
+  await page.evaluate((t) => {
+    let el = document.getElementById('__proof_caption');
+    if (!el) {
+      el = document.createElement('div'); el.id = '__proof_caption';
+      el.style.cssText = 'position:fixed;left:0;right:0;bottom:0;z-index:2147483647;padding:10px 16px;' +
+        'font:600 18px/1.3 system-ui,sans-serif;color:#fff;background:rgba(17,24,39,.88);pointer-events:none';
+      document.documentElement.appendChild(el);
+    }
+    el.textContent = t;
+  }, text).catch(() => {});
+}
+
+async function runFlow(page, out, written) {
+  const script = opt('script');
+  if (!script) return;
+  const mod = await import(pathToFileURL(path.resolve(script)).href);
+  const flow = mod.default || mod.flow;
+  if (typeof flow !== 'function') die(`${script} must export a default async function ({ page, step, snap })`);
+  let n = 0, last = '';
+  const step = async (text) => {
+    last = `${++n}. ${text}`; console.log(`step ${last}`);
+    await caption(page, last); await page.waitForTimeout(700);
+  };
+  // Re-show the caption after navigations, which wipe it.
+  page.on('load', () => { if (last) caption(page, last); });
+  const snap = async (name) => {
+    const f = out.replace(/\.[^.]+$/, `-${String(name).replace(/[^\w.-]+/g, '-')}.png`);
+    await page.screenshot({ path: f, fullPage: flag('full') }); written.push(f);
+  };
+  await flow({ page, step, snap, caption: (t) => caption(page, t) });
+}
+
+async function shot() {
+  if (!target) die('usage: proof shot <url|file> [--script flow.mjs] [--full] [--wait <selector>] [--out f.png]');
+  const out = outPath(), written = [];
+  const { b, page, problems } = await browser();
+  let ok = false;
+  try {
+    await page.goto(toUrl(target), { waitUntil: 'load' });
+    if (opt('wait')) await page.waitForSelector(opt('wait'), { timeout: 30000 });
+    await runFlow(page, out, written);
+    await page.waitForTimeout(300);
+    ok = true;
+  } finally {
+    await page.screenshot({ path: out, fullPage: flag('full') }).catch(() => {});   // on failure: where it broke
+    await b.close();
+    if (!ok) console.error(`proof: failed, screenshot kept at ${out}`);
+  }
+  written.unshift(out);
+  report(written, problems);
+}
+
+async function video() {
+  if (!target) die('usage: proof video <url|file> [--script flow.mjs] [--seconds 5] [--out f.mp4]');
+  if (spawnSync('ffmpeg', ['-version']).status !== 0) die('ffmpeg is not installed in this image');
+  const out = outPath(), written = [];
+  const { b, ctx, page, problems } = await browser();
+  const frames = [];   // { t: seconds, data: jpeg }
+  const cdp = await ctx.newCDPSession(page);
+  cdp.on('Page.screencastFrame', (f) => {
+    frames.push({ t: f.metadata.timestamp, data: Buffer.from(f.data, 'base64') });
+    cdp.send('Page.screencastFrameAck', { sessionId: f.sessionId }).catch(() => {});
+  });
+  let failure, stopped;
+  try {
+    await cdp.send('Page.startScreencast', { format: 'jpeg', quality: 80, maxWidth: W, maxHeight: H });
+    await page.goto(toUrl(target), { waitUntil: 'load' });
+    if (opt('wait')) await page.waitForSelector(opt('wait'), { timeout: 30000 });
+    const limit = new Promise((_, rej) => setTimeout(() => rej(new Error(`flow ran longer than ${MAX_SECONDS}s`)), MAX_SECONDS * 1000).unref());
+    await Promise.race([runFlow(page, out, written), limit]);
+    await page.waitForTimeout(1000 * +(opt('seconds') || (opt('script') ? 1.5 : 5)));
+  } catch (e) {
+    failure = e;   // keep the recording: it shows where the flow broke
+    await caption(page, `FAILED: ${String(e.message || e).split('\n')[0].slice(0, 160)}`);
+    await page.waitForTimeout(1500);
+  } finally {
+    stopped = Date.now() / 1000;
+    await cdp.send('Page.stopScreencast').catch(() => {});
+    await b.close();
+  }
+  if (!frames.length) die('no frames captured');
+  await encode(frames, stopped, out); written.unshift(out);
+  report(written, problems);
+  if (failure) { console.error(`proof: the flow failed (recording kept): ${failure.message || failure}`); process.exit(2); }
+}
+
+// Screencast frames arrive only when the page changes: resample them to a constant frame rate,
+// holding the last frame until recording stopped.
+function encode(frames, stopped, out) {
+  return new Promise((resolve, reject) => {
+    const ff = spawn('ffmpeg', ['-y', '-loglevel', 'error', '-f', 'image2pipe', '-framerate', String(FPS), '-i', '-',
+      '-vf', 'scale=trunc(iw/2)*2:trunc(ih/2)*2', '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '28',
+      '-pix_fmt', 'yuv420p', '-movflags', '+faststart', out], { stdio: ['pipe', 'inherit', 'inherit'] });
+    ff.on('error', reject);
+    ff.on('close', (code) => (code === 0 ? resolve() : reject(new Error(`ffmpeg exited ${code}`))));
+    const start = frames[0].t, end = Math.max(stopped, frames[frames.length - 1].t) + 0.5;
+    let i = 0;
+    for (let t = start; t <= end; t += 1 / FPS) {
+      while (i + 1 < frames.length && frames[i + 1].t <= t) i++;
+      ff.stdin.write(frames[i].data);
+    }
+    ff.stdin.end();
+  });
+}
+
+async function term() {
+  if (!cmd.length) die('usage: proof term [--title <text>] [--lines 60] [--out f.png] -- <command …>');
+  const out = outPath();
+  // One argument = a shell command line (pipes etc. work); several = argv, quoted for sh.
+  const line = cmd.length === 1 ? cmd[0] : cmd.map((a) => (/^[\w./=:@%+-]+$/.test(a) ? a : `'${a.replace(/'/g, `'\\''`)}'`)).join(' ');
+  const r = spawnSync('sh', ['-c', `(${line}) 2>&1`],
+    { encoding: 'utf8', maxBuffer: 64 << 20, timeout: 30 * 60 * 1000 });
+  const text = (r.stdout || '').replace(/\x1b\[[0-9;?]*[A-Za-z]/g, '').replace(/\r(?!\n)/g, '\n');
+  process.stdout.write(text);
+  const lines = text.trimEnd().split('\n'), keep = +(opt('lines') || 60);
+  const shown = lines.length > keep ? [`… ${lines.length - keep} earlier lines not shown`, ...lines.slice(-keep)] : lines;
+  const code = r.status ?? 1;
+  const esc = (s) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;');
+  const html = `<!doctype html><meta charset="utf-8"><body style="margin:0;background:#0d1117;color:#e6edf3;font:14px/1.45 ui-monospace,Menlo,monospace">
+<div id="t" style="display:inline-block;min-width:${W - 48}px;padding:20px 24px">
+<div style="color:#8b949e;margin-bottom:6px">${esc(opt('title') || process.cwd())} · ${new Date().toISOString().slice(0, 16).replace('T', ' ')} UTC</div>
+<div style="color:#7ee787">$ ${esc(line)}</div>
+<pre style="margin:6px 0;white-space:pre-wrap;word-break:break-all">${esc(shown.join('\n'))}</pre>
+<div style="color:${code === 0 ? '#7ee787' : '#ff7b72'}">exit ${code}</div></div>`;
+  const { b, page } = await browser();
+  try {
+    await page.setContent(html);
+    await page.locator('#t').screenshot({ path: out });
+  } finally { await b.close(); }
+  report([out], []);
+  if (code !== 0) { console.error(`proof: the command exited ${code} (screenshot kept)`); process.exit(code); }
+}
+
+function report(files, problems) {
+  for (const f of files) console.log(`wrote ${f} (${Math.round(fs.statSync(f).size / 1024)} KB)`);
+  const uniq = [...new Set(problems)];
+  console.log(uniq.length ? `page problems (${uniq.length}):\n  ${uniq.slice(0, 15).join('\n  ')}` : 'page problems: none');
+}
+
+const run = { shot, video, term }[kind];
+if (!run) die('usage: proof shot|video|term … (see the header of this file: sed -n 2,25p "$(command -v proof)")');
+run().catch((e) => die(String(e.stack || e).slice(0, 600)));

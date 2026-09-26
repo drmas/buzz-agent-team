@@ -24,12 +24,21 @@ and the docs we use to run it. Fork it, fill in `setup/config.env`, and follow `
   silent. Optional: without a TypeSafe key it answers "reply" and nothing changes.
 - **The right model for the job.** Each agent has its own model and effort level: Sonnet for
   PM, Designer and Marketing, Opus for Engineer and the general assistant, all at medium effort and
-  changeable with `agentctl model`. Claude agents hand heavy work to an Opus `deep-work` subagent
-  and lookups to a Haiku `scout`. `agentctl runtime` moves an agent between Claude Code and Codex
-  without losing its identity or memory.
+  changeable with `agentctl model`. Every agent orchestrates a small team of subagents, ported from
+  [drmas/codex-agent-team](https://github.com/drmas/codex-agent-team): an explorer and researcher
+  for discovery, a planner, a worker that implements and tests, and an independent reviewer
+  (plus `deep-work` for non-code work on Claude agents). `agentctl runtime` moves an agent between
+  Claude Code and Codex without losing its identity or memory.
+- **Stack skills where they help.** Engineering agents get React, composition, Postgres and UI
+  guideline skills from Vercel, Supabase and Anthropic, fetched at pinned commits; the Designer gets
+  the design ones. `agentctl skills` changes who has what. The image includes headless Chromium for
+  e2e tests, plus Playwright and ffmpeg for recording proof.
 - **Cheap ambient listening.** Before an agent's main model sees a channel message it wasn't
   mentioned in, `ambient-gate` asks a fast model whether the message is for it. Messages that
   clearly aren't cost nothing.
+- **Proof with every delivery.** An agent that reports finished work attaches a screenshot or a
+  short captioned video of the test it ran (`proof`: headless Chromium + Playwright + ffmpeg), so
+  you can check the work from the chat. No proof, not done.
 - **File handoffs between agents.** Workspaces are private, so agents hand files over with
   `handoff`: a read-only snapshot every agent can open at `/exchange/<agent>/…`, plus one Buzz
   message with real mentions and the file list (images also attached in Buzz). `attachments`
@@ -73,12 +82,14 @@ Your laptop                            agentctl (manage agents), systemd units
 | `setup/config.example.env` | Every deployment-specific value; copy to `config.env` (git-ignored) |
 | `setup/provision.sh`, `user-data.sh` | Create the EC2 host, IAM role, security group, Elastic IP |
 | `setup/setup-agents.sh`, `boot-unit.sh` | Agent image, first agents, secrets refresh, start on boot |
-| `setup/agentctl` | Server-side CLI: add/remove agents, models, runtimes, prompts, listening, profiles, memory mirror, handoff cleanup |
+| `setup/agentctl` | Server-side CLI: add/remove agents, models, memory limits, skills, runtimes, prompts, listening, profiles, memory mirror, handoff cleanup |
 | `setup/deploy-team.sh` | Ship agentctl, prompts, skills, tools and Claude settings; create team agents; set default models; restart what changed |
-| `setup/prompts/` | Role prompts, team rules (`_team.md`), turn-taking (`_turns.md`), files (`_files.md`), delegation (`_delegate.md`), people |
-| `setup/tools/` | `mem`, `mem-mirror`, `turn-gate`, `ambient-gate`, `handoff`, `attachments` (on every agent's PATH) |
-| `setup/claude/` | Claude agents' managed settings (ambient-gate hook) and subagents (`deep-work`, `scout`) |
-| `setup/skills/` | `memory`, `update-instructions` |
+| `setup/prompts/` | Role prompts, team rules (`_team.md`), turn-taking (`_turns.md`), files (`_files.md`), proof of work (`_proof.md`), delegation (`_delegate.md`, `_delegate-codex.md`), people |
+| `setup/tools/` | `mem`, `mem-mirror`, `turn-gate`, `ambient-gate`, `handoff`, `attachments`, `proof` (on every agent's PATH) |
+| `setup/claude/` | Claude agents' managed settings (ambient-gate hook) and subagents (`explorer`, `researcher`, `planner`, `worker`, `reviewer`, `deep-work`) |
+| `setup/codex/` | Codex agents' custom agents (the same roles, from drmas/codex-agent-team) |
+| `setup/skills/` | `memory`, `update-instructions` (every agent) |
+| `setup/skill-library.txt` | Opt-in third-party skills, pinned by commit; given per agent with `agentctl skills` |
 | `setup/sign-owner-proofs.py`, `publish-owner-records.py`, `share-assistants.sh` | Make Buzz show the agents as your shared assistants |
 | `setup/setup-channels.sh`, `enable-listening.sh`, `setup-workflows.sh`, `setup-mirror.sh` | Channels, listening rules, scheduled check-ins, nightly memory mirror and handoff cleanup |
 | `setup/buzz-team` | Laptop CLI: shell / Claude Code / Codex inside any agent, logs, restarts |

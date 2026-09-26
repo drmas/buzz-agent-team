@@ -17,6 +17,9 @@ RUN apk add --no-cache nodejs npm ripgrep \
  && npm i -g @anthropic-ai/claude-code@2.1.281 @openai/codex@0.156.1 \
       @agentclientprotocol/claude-agent-acp@0.81.2 @agentclientprotocol/codex-acp@1.13.1 \
  && npm cache clean --force
+RUN apk add --no-cache chromium nss freetype harfbuzz ttf-freefont font-noto-emoji
+RUN apk add --no-cache ffmpeg && npm i -g playwright-core@1.63.0 && npm cache clean --force   # proof tool
+ENV CHROME_BIN=/usr/bin/chromium-browser PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium-browser PUPPETEER_SKIP_DOWNLOAD=true PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
 USER agent
 EOF
 
@@ -28,6 +31,7 @@ x-agent: &agent
   restart: on-failure            # an owner !shutdown stays stopped
   read_only: true
   tmpfs: ["/tmp:size=512m"]
+  shm_size: 1g                   # headless Chrome needs more than Docker's 64 MB /dev/shm
   cap_drop: [ALL]
   security_opt: ["no-new-privileges:true"]
   pids_limit: 512

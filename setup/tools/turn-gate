@@ -4,6 +4,8 @@
 //
 //   turn-gate --channel <uuid> --event <event-id>
 //
+// Direct messages, and messages that @name only this agent, always get REPLY right away.
+//
 // Prints one decision line (plus a short reason) and exits 0:
 //   REPLY         reply now
 //   REPLY-AFTER   other agents replied first: read their replies, add only what's new from your area
@@ -54,6 +56,19 @@ function roster() {
   return agents;
 }
 
+// Direct messages always get a reply. DM channels are named "DM" by the relay.
+function isDM() {
+  try {
+    const out = execFileSync('buzz', ['channels', 'get', '--channel', channel],
+      { encoding: 'utf8', timeout: 30000, stdio: ['ignore', 'pipe', 'pipe'] });
+    return /\bDM\b/.test(JSON.parse(out).name || '');
+  } catch { return false; }
+}
+
+// "@Name" in the message text (case-insensitive, not followed by more of a word).
+const esc = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+const namedIn = (text, a) => new RegExp(`@${esc(a.name)}(?![\\w-])`, 'i').test(text) || text.includes(a.pubkey);
+
 function thread() {
   const out = execFileSync('buzz', ['messages', 'thread', '--channel', channel, '--event', event, '--limit', '100'],
     { encoding: 'utf8', timeout: 30000, stdio: ['ignore', 'pipe', 'pipe'] });
@@ -75,6 +90,7 @@ async function main() {
   if (!channel || !/^[0-9a-f]{64}$/.test(event || '')) {
     console.error('usage: turn-gate --channel <uuid> --event <event-id>'); process.exit(1);
   }
+  if (isDM()) return done('REPLY', 'direct message');
   if (!process.env.TYPESAFE_API_KEY) return done('REPLY', 'gate off (no TYPESAFE_API_KEY)');
   const me = process.env.AGENT_PUBKEY;
   const agents = roster();
@@ -88,9 +104,15 @@ async function main() {
   const idx = events.findIndex((e) => e.id === event);
   if (idx < 0) return done('REPLY', 'gate off (event not found in thread)');
   const trigger = events[idx];
-  const mentioned = [...new Set(trigger.tags.filter((t) => t[0] === 'p').map((t) => t[1]))]
+  // Who the message is for: the agents @named in its text. `p` tags alone aren't enough, since
+  // thread replies can carry the tags of earlier participants; they only count when no agent is
+  // named in the text (e.g. a mention written as nostr:npub…).
+  const others = agents.filter((a) => a.pubkey !== trigger.pubkey);
+  const named = others.filter((a) => namedIn(trigger.content, a)).map((a) => a.pubkey);
+  const tagged = [...new Set(trigger.tags.filter((t) => t[0] === 'p').map((t) => t[1]))]
     .filter((pk) => byKey[pk] && pk !== trigger.pubkey);
-  if (!mentioned.includes(me) || mentioned.length < 2) return done('REPLY', 'not a multi-agent mention');
+  const mentioned = named.length ? [...new Set([...named, me])] : tagged;
+  if (!mentioned.includes(me) || mentioned.length < 2) return done('REPLY', 'you are the only agent mentioned');
   const candidates = agents.filter((a) => mentioned.includes(a.pubkey)); // roster order = tie-break
 
   // 1) Order. The state is the thread up to the trigger, with nothing about "me", so every mentioned

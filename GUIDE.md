@@ -112,7 +112,8 @@ If it doesn't see them, check `buzz-team logs pm` for errors after the restart.
 | `/outbox` | Files it has handed off (only it can write here) |
 | `/exchange/<agent>/` | Every agent's handoffs (read-only) |
 | `/workspace/inbox/<event>/` | Attachments it downloaded from Buzz messages |
-| `~/.claude/agents/team/` | The `deep-work` and `scout` subagents (Claude agents, read-only) |
+| `~/.claude/agents/team/` or `~/.codex/agents/` | Its subagent roles (read-only) |
+| `~/.claude/skills/` or `~/.codex/skills/` | Its skills (read-only) |
 | `~/.turn-gate.log`, `~/.ambient-gate.log` | Every turn-taking and ambient-gate decision |
 
 Everything else in the container is read-only by design.
@@ -134,6 +135,10 @@ agent ahead of it, 180 s at most). Every decision, with Jev's probabilities, is 
 agent's `~/.turn-gate.log` (`buzz-team shell pm`, then `tail ~/.turn-gate.log`). No TypeSafe key,
 or any error, means `REPLY`: the old behaviour.
 
+A direct message, or a message that @names only one agent, always gets an answer: the gate isn't
+used there. Only the agents @named in the text count, not `p` tags a thread reply inherits from
+earlier participants.
+
 ## Models and effort
 
 Each agent has one main model and effort level, set for its everyday work. On the server:
@@ -148,15 +153,24 @@ agentctl model pm default          # back to the runtime's default model
 Claude efforts: `low`, `medium`, `high`, `xhigh`, `max`. Codex efforts: `minimal`, `low`,
 `medium`, `high`, `xhigh`. Claude model names: `sonnet`, `opus`, `haiku`, `fable`, or a full model id.
 
-Claude agents can also switch models within a single task through two subagents:
+Each agent is also an orchestrator with a small team of subagents, ported from
+[drmas/codex-agent-team](https://github.com/drmas/codex-agent-team). Substantial code changes go
+to a worker, then to an independent reviewer; findings go back to a worker.
 
-| Subagent | Model | Used for |
-|---|---|---|
-| `deep-work` | Opus | Specs, plans, designs, multi-file code changes, reviews, careful analysis |
-| `scout` | Haiku | Reading long threads, searching memory and files, collecting facts |
+| Role | Claude agents | Codex agents | Used for | Edits files |
+|---|---|---|---|---|
+| `explorer` | Haiku | gpt-5.6-luna, max | Finding code, callers, patterns, tests; long threads, memory, files | no |
+| `researcher` | Sonnet | gpt-5.6-luna, max | Behavior, root causes, change impact, library docs | no |
+| `planner` | Opus | gpt-6-astra, medium | Multi-step plans with file ownership and validation | no |
+| `worker` | Sonnet | gpt-5.6-sol, medium | Implementing a scoped change and running its tests | yes |
+| `reviewer` | Opus | gpt-5.6-sol, high | Independent review of a finished diff | no |
+| `deep-work` | Opus | – | Non-code work: specs, designs, copy, analysis | /workspace |
 
-The agents decide when to delegate (rule in `prompts/_delegate.md`). You can also ask directly:
-"@PM use deep-work to write the full spec".
+Claude Code runs subagents at the agent's own effort (it ignores per-subagent effort), so where
+the Codex roles use higher effort, the Claude roles use a stronger model instead. The agents
+decide when to delegate (rules in `prompts/_delegate.md` and `_delegate-codex.md`). You can also
+ask directly: "@Engineer have the reviewer check that diff", "@PM use deep-work to write the full
+spec".
 
 To move an agent between Claude Code and Codex (keeps its Buzz identity, memory, workspace and
 standing instructions; set its model again afterwards, and reinstall any plugins or MCP servers,
@@ -167,6 +181,28 @@ agentctl runtime engineer codex && agentctl login-codex engineer
 ```
 
 `engineer` ran on Codex until it was moved to Claude Code with `agentctl runtime engineer claude`.
+
+## Skills
+
+`memory` and `update-instructions` go to every agent. Stack skills are opt-in per agent, listed in
+`setup/skill-library.txt` and fetched on the server at a pinned commit:
+
+| Skill | From | Default agents |
+|---|---|---|
+| `vercel-react-best-practices` | vercel-labs/agent-skills | Engineer, Claude, Codex |
+| `vercel-composition-patterns` | vercel-labs/agent-skills | Engineer, Claude, Codex, Designer |
+| `web-design-guidelines` | vercel-labs/agent-skills | Engineer, Claude, Codex, Designer |
+| `supabase-postgres-best-practices` | supabase/agent-skills | Engineer, Claude, Codex |
+| `frontend-design` | anthropics/skills | Engineer, Claude, Codex, Designer |
+
+```bash
+agentctl skills engineer                        # show
+agentctl skills designer frontend-design web-design-guidelines   # set (restarts it)
+agentctl skills pm none                         # remove all opt-in skills
+```
+
+To add a skill, add a line to `setup/skill-library.txt` and run `./deploy-team.sh`, then
+`agentctl skills <agent> …`. Every skill's description is read on each turn, so keep lists short.
 
 ## Files between agents
 
@@ -190,12 +226,25 @@ handoff --channel <uuid> --reply-to <event> --to Engineer --file spec.md --file 
   yourself: `buzz-team shell <agent>`, then `ls /exchange`.
 - Handoffs older than 30 days are deleted nightly (`agentctl prune-exchange [days]` to run it by hand).
 
+## Proof with every delivery
+
+When an agent reports that it built or fixed something, it attaches proof of the test it ran to
+that message (rule in `prompts/_proof.md`), so you can validate the work from the chat:
+
+- UI work: a short MP4 of the real flow, with a caption for each step, plus a screenshot of the
+  end state.
+- Backend, API or CLI work: a screenshot of the test run or requests, output and exit code included.
+
+Agents make these with `proof` (`proof video|shot <url> [--script flow.mjs]`, `proof term -- <cmd>`),
+which drives the container's headless Chromium. Captures stay in the agent's `/workspace/proof/`.
+If a report comes without proof, ask for it: the agents are told to treat that as not done.
+
 ## Ambient gate: fewer wasted turns
 
 Agents read every human message in their channels, but most need no reply. Before the main model
 runs, `ambient-gate` asks a fast model (Jev, or Haiku without a TypeSafe key) whether the message
 is for this agent. If it clearly isn't, the turn ends right away: no tokens, no reply. Mentions,
-DMs and scheduled check-ins always go through. Decisions are logged in each agent's
+DMs, scheduled check-ins and messages that write the agent's `@Name` always go through. Decisions are logged in each agent's
 `~/.ambient-gate.log`:
 
 ```bash
@@ -212,8 +261,10 @@ through; default 0.3) or `AMBIENT_GATE=off` to `/opt/buzz-agents/<agent>.env` on
 
 | Command | What it does |
 |---|---|
-| `agentctl list` | Agents, model/effort and status |
+| `agentctl list` | Agents, model/effort, memory limit and status |
 | `agentctl model <agent> [model] [effort]` | Show or change an agent's model and effort |
+| `agentctl mem <agent> [size]` | Show or change its memory limit, e.g. `4g` (restarts it) |
+| `agentctl skills <agent> [skill …\|none]` | Show or change its opt-in skills (restarts it) |
 | `agentctl runtime <agent> claude\|codex` | Switch an agent between Claude Code and Codex |
 | `agentctl restart <agent>` / `agentctl logs <agent> 100` | Restart / logs |
 | `agentctl listen <agent> <channel> …` | Channels it reads without a mention (none = mentions only) |
@@ -232,6 +283,8 @@ editing it, run `agentctl sync`. (Better: edit `setup/prompts/_people.md` and ru
 |---|---|
 | `Your session has expired` | `aws login` |
 | `SessionManagerPlugin is not found` | `yay -S aws-session-manager-plugin` |
+| Agent reports work without a screenshot or video | Ask for proof in the thread. If it says `proof` failed, check it in the container: `buzz-team shell engineer`, then `proof term -- echo ok` |
+| Agent didn't answer a DM or a mention of only it | Check `~/.turn-gate.log` and `~/.ambient-gate.log` for that event; both should say `REPLY`. Resend with a real mention (picked from the list, not typed) |
 | `permission denied … docker.sock` in a server shell | You're `ssm-user`; run `sudo -i` first |
 | Agent doesn't use a new plugin or MCP server | `buzz-team restart <agent>`, then check `buzz-team logs <agent>` |
 | Agent doesn't reply | Check it's a member of the channel and `buzz-team logs <agent>` |

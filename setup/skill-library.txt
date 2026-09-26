@@ -1,0 +1,9 @@
+# Opt-in skills, fetched on the server at a pinned commit into skill-library/<name>/ (agentctl skills-fetch).
+# Give them to agents with: agentctl skills <id> <name> ...   (memory and update-instructions go to every agent)
+# To update one, change its commit and run ./deploy-team.sh.
+# name                              repo                      commit                                    path in repo
+vercel-react-best-practices         vercel-labs/agent-skills  063bee94c3f4df8453406c830b0a7df0f2860278  skills/react-best-practices
+vercel-composition-patterns         vercel-labs/agent-skills  063bee94c3f4df8453406c830b0a7df0f2860278  skills/composition-patterns
+web-design-guidelines               vercel-labs/agent-skills  063bee94c3f4df8453406c830b0a7df0f2860278  skills/web-design-guidelines
+supabase-postgres-best-practices    supabase/agent-skills     551274ed2fe97c8fea1325f7ceb05803a542f8df  skills/supabase-postgres-best-practices
+frontend-design                     anthropics/skills         33375500bcea98d610eb30ce10ac4e59b89c390d  skills/frontend-design

@@ -122,8 +122,10 @@ humans) first, then:
 ```
 
 Installs `agentctl`, prompt sources, skills (`update-instructions`, `memory`), tools (`mem`,
-`mem-mirror`, `turn-gate`, `ambient-gate`, `handoff`, `attachments`) and the Claude agents'
-managed settings and subagents; creates `pm`, `designer`, `marketing` and `engineer` (Claude
+`mem-mirror`, `turn-gate`, `ambient-gate`, `handoff`, `attachments`, `proof`), the Claude agents'
+managed settings and subagents and the Codex agents' custom agents; fetches the opt-in skills in
+`skill-library.txt` and gives agents without a skill list their defaults; adds headless Chromium,
+and ffmpeg + `playwright-core` for `proof`, to the image if missing; creates `pm`, `designer`, `marketing` and `engineer` (Claude
 Code); sets each agent's default model and effort where none is set; builds each agent's
 instructions with the auto-generated "Who's who" roster; starts everything. It is idempotent:
 re-run it after editing any prompt, skill or tool.
@@ -222,10 +224,12 @@ updates automatically.
 | Task | How |
 |---|---|
 | **Renew the Claude token (valid 1 year; note the date in `DEPLOYMENT.local.md`)** | Step 3 again, then on the server `/opt/buzz-agents/refresh-secrets.sh` and `agentctl restart <id>` for each Claude agent |
-| Upgrade Claude Code / Codex / adapters | Edit the pinned versions in `/opt/buzz-agents/Dockerfile`, then `docker compose -p buzz-agents build && agentctl render && docker compose -p buzz-agents up -d`. Then check the model and effort still apply (`agentctl list`, first reply) and that `~/.ambient-gate.log` still gets entries: both rely on Claude Code settings and hooks behaving the same |
+| Upgrade Claude Code / Codex / adapters / `playwright-core` | Edit the pinned versions in `/opt/buzz-agents/Dockerfile`, then `docker compose -p buzz-agents build && agentctl render && docker compose -p buzz-agents up -d`. Then check the model and effort still apply (`agentctl list`, first reply) and that `~/.ambient-gate.log` still gets entries: both rely on Claude Code settings and hooks behaving the same |
 | Change team rules, roles, roster people | Edit `setup/prompts/*`, run `./deploy-team.sh` (or edit `prompts/src/` on the server + `agentctl sync`) |
 | Turn the turn-taking gate on/off | Store / delete `/buzz/typesafe-api-key`, then `./deploy-team.sh` (reloads secrets, recreates agents). Without the key, `ambient-gate` switches to Haiku |
 | Change an agent's model or effort | `agentctl model <id> <model> <effort>` (restarts it) |
+| Change an agent's skills | `agentctl skills <id> <skill…>\|none` (restarts it). Add or update a skill: edit `setup/skill-library.txt` (name, repo, commit, path), run `./deploy-team.sh` |
+| Change an agent's memory limit | `agentctl mem <id> <size>` (restarts it). Defaults: new agents 2g, `claude`/`codex` 3g, `engineer` 4g for headless Chrome. Limits are caps, not reservations; if several agents run browsers at once, resize the server (t3.xlarge = 16 GB) |
 | Move an agent between Claude Code and Codex | `agentctl runtime <id> claude\|codex`, then `agentctl model …` (and `agentctl login-codex <id>` for Codex) |
 | Tune or turn off the ambient gate for one agent | `AMBIENT_GATE_MIN=<0–1>` or `AMBIENT_GATE=off` in `/opt/buzz-agents/<id>.env`, then `agentctl restart <id>` |
 | Clean up file handoffs now | `agentctl prune-exchange [days]` (nightly it keeps 30 days) |
@@ -256,7 +260,9 @@ updates automatically.
   anything is left for them: `SKIP`, or `REPLY-AFTER` adding only what's new. Without
   `/buzz/typesafe-api-key`, or on any error, it answers `REPLY` (the old behaviour). Decisions are
   logged to `~/.turn-gate.log` in each agent's home; wait times and thresholds are constants at the
-  top of `tools/turn-gate` (re-run `deploy-team.sh` after changing them).
+  top of `tools/turn-gate` (re-run `deploy-team.sh` after changing them). DMs and messages that
+  @name a single agent always get `REPLY`; only agents @named in the text count, since thread
+  replies can inherit `p` tags from earlier participants.
 - Listening rules exclude every agent's pubkey and the relay's key, so agents and workflows can't
   trigger each other without an explicit mention (loop protection).
 - `buzz channels list` shows channels you can see, not necessarily ones you're a member of; check
@@ -277,9 +283,18 @@ updates automatically.
   `agentctl runtime <id> claude|codex` switches an agent's runtime in place (identity, memory,
   workspace and standing instructions stay; plugins and MCP servers don't, they're per runtime);
   `deploy-team.sh` uses it to move an existing Codex `engineer` to Claude Code.
-- **Subagents:** Claude agents get `deep-work` (Opus) and `scout` (Haiku) from `claude/agents/`,
-  mounted read-only at `~/.claude/agents/team/`, plus a prompt section (`prompts/_delegate.md`)
-  saying when to use them. So chat stays on the cheap model and heavy work gets the strong one.
+- **Subagents:** the explorer / researcher / planner / worker / reviewer roles from
+  [drmas/codex-agent-team](https://github.com/drmas/codex-agent-team). Claude agents get them
+  (plus `deep-work` for non-code work) from `claude/agents/`, mounted read-only at
+  `~/.claude/agents/team/`; Codex agents get the original TOML roles from `codex/agents/` at
+  `~/.codex/agents/`. The routing rules are prompt sections (`prompts/_delegate.md`,
+  `_delegate-codex.md`), so they are instructions, not enforcement. Chat stays on the agent's own
+  model and heavy work goes to the right one. The Codex roles name `gpt-6-astra`,
+  `gpt-5.6-luna` and `gpt-5.6-sol`; if the signed-in ChatGPT account can't use them, edit
+  `codex/agents/*.toml`.
+- **Skills:** `skills/*` go to every agent. The ones in `skill-library.txt` are downloaded from
+  GitHub at the pinned commit into `/opt/buzz-agents/skill-library/` (`agentctl skills-fetch`)
+  and mounted only for agents that list them in `<id>.skills` (`agentctl skills`).
   Subagents run at the agent's effort level; this Claude Code version ignores `effort:` in
   subagent frontmatter.
 - **Ambient gate:** every human message in a listened-to channel used to be a full model turn,
@@ -300,7 +315,7 @@ updates automatically.
   (checked by file content, max 50 MB, 500 MB for video), which is why documents go through
   `/exchange`. The nightly mirror timer also runs `agentctl prune-exchange 30`.
 - The Claude subscription is shared by every Claude agent, so the cheaper defaults (Sonnet for
-  chat-heavy roles, the ambient gate, `scout` for lookups) also make its usage limits last longer.
+  chat-heavy roles, the ambient gate, a Haiku `explorer` for lookups) also make its usage limits last longer.
 - `claude setup-token` run from a chat command box leaks the token's tail into the chat; run it in
   a real terminal.
 

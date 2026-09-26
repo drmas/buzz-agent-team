@@ -5,6 +5,9 @@
 #   agentctl add <id> <claude|codex> --name NAME [--about TEXT] [--respond-to MODE] [--mem 2g] [--kind team|solo]
 #                [--model M] [--effort E]
 #   agentctl model <id> [<model|default|-> [effort|default|-]] [--no-restart]   # no args: show; - keeps current
+#   agentctl mem <id> [size] [--no-restart]   # show or change the memory limit, e.g. 4g (headless Chrome needs ~1-2g)
+#   agentctl skills <id> [name ...|none] [--no-restart]   # show or set its opt-in skills (from skill-library.txt)
+#   agentctl skills-fetch              # download skill-library.txt skills at their pinned commits
 #   agentctl runtime <id> <claude|codex> [--no-restart]   # switch runtime; keeps identity, memory, workspace, instructions
 #   agentctl profile <id> --name NAME [--about TEXT]
 #   agentctl login-codex <id>          # ChatGPT device login for a codex agent
@@ -19,12 +22,14 @@
 #
 # Registry: agents.list ("<id> <runtime> <mem> <kind>"); <id>.meta = display name / about.
 # Prompt sources: prompts/src/<id>.md (role), _team.md (team agents only), _turns.md, _people.md
-# (humans + company, edit by hand), _instructions.md, _files.md, _delegate.md (Claude agents), _ambient.md
-# (Codex agents that listen). Built per agent into prompts/<id>.md (mounted read-only at /prompts)
+# (humans + company, edit by hand), _instructions.md, _files.md, _proof.md, _delegate.md (Claude agents),
+# _delegate-codex.md (Codex agents), _ambient.md (Codex agents that listen). Built per agent into prompts/<id>.md (mounted read-only at /prompts)
 # with an auto-generated "Who's who" roster.
 # Model and effort live in <id>.env: ANTHROPIC_MODEL + CLAUDE_CODE_EFFORT_LEVEL (Claude) or
 # CODEX_CONFIG={"model":…,"model_reasoning_effort":…} (Codex). Claude agents also get
-# claude/managed-settings.json (ambient-gate hook) and the claude/agents/ subagents, read-only.
+# claude/managed-settings.json (ambient-gate hook) and the claude/agents/ subagents, read-only;
+# Codex agents get the codex/agents/ custom agents. Skills: skills/* go to every agent; the opt-in
+# ones listed in <id>.skills come from skill-library/ (see skill-library.txt).
 # File handoffs: exchange/<id>/ is the agent's /outbox (only it can write there); the whole
 # exchange/ is mounted read-only at /exchange in every agent (see tools/handoff).
 set -euo pipefail
@@ -69,6 +74,7 @@ x-agent: &agent
   restart: on-failure            # an owner !shutdown stays stopped
   read_only: true
   tmpfs: ["/tmp:size=512m"]
+  shm_size: 1g                   # headless Chrome crashes with Docker's 64 MB /dev/shm; counts toward mem_limit only when used
   cap_drop: [ALL]
   security_opt: ["no-new-privileges:true"]
   pids_limit: 512
@@ -120,9 +126,15 @@ EOF
         [ -d "$sk" ] || continue; sk=$(basename "$sk")
         echo "      - ./skills/$sk:/home/agent/$cfg/skills/$sk:ro"
       done
+      for sk in $(cat "$id.skills" 2>/dev/null); do
+        [ -f "skill-library/$sk/SKILL.md" ] || continue
+        echo "      - ./skill-library/$sk:/home/agent/$cfg/skills/$sk:ro"
+      done
       if [ "$rt" = claude ]; then
         echo "      - ./claude/managed-settings.json:/etc/claude-code/managed-settings.json:ro   # ambient-gate hook"
-        echo "      - ./claude/agents:/home/agent/.claude/agents/team:ro   # deep-work / scout subagents"
+        echo "      - ./claude/agents:/home/agent/.claude/agents/team:ro   # explorer / researcher / planner / worker / reviewer / deep-work"
+      else
+        echo "      - ./codex/agents:/home/agent/.codex/agents:ro   # explorer / researcher / planner / worker / reviewer roles"
       fi
       echo "    networks: [$id-net]"
     done < agents.list
@@ -145,6 +157,30 @@ prep_home() {  # id runtime
       mkdir -p "/h/$CFG/skills" "/h/$CFG/agents" /h/instructions-history
       [ -f "/h/$CFG/$FILE" ] || cp /header.md "/h/$CFG/$FILE"
       chown 1000:1000 "/h/$CFG" "/h/$CFG/skills" "/h/$CFG/agents" "/h/$CFG/$FILE" /h/instructions-history'
+}
+
+# skill-library/<name>/ from skill-library.txt at the pinned commit. Updated in place (same
+# directory) so running agents' read-only mounts stay valid.
+fetch_skills() {
+  local name repo sha path cache src
+  install -d -m 755 skill-library
+  cache=$(mktemp -d); trap "rm -rf '$cache'" EXIT   # expanded now: $cache is local, gone at exit
+  while read -r name repo sha path; do
+    case "${name:-#}" in '#'*) continue;; esac
+    [ "$(cat "skill-library/$name/.commit" 2>/dev/null)" = "$sha" ] && continue
+    if [ ! -d "$cache/$sha" ]; then   # one download per repo commit
+      mkdir "$cache/$sha"
+      curl -fsSL "https://codeload.github.com/$repo/tar.gz/$sha" | tar -xz -C "$cache/$sha" || die "download failed: $repo@$sha"
+    fi
+    src=$(echo "$cache/$sha"/*/"$path")
+    [ -f "$src/SKILL.md" ] || die "$repo@$sha has no $path/SKILL.md"
+    install -d -m 755 "skill-library/$name"
+    find "skill-library/$name" -mindepth 1 -delete
+    cp -r "$src/." "skill-library/$name/"; find "skill-library/$name" -name '*.zip' -delete
+    echo "$sha" > "skill-library/$name/.commit"
+    chown -R root:root "skill-library/$name"; chmod -R a+rX,go-w "skill-library/$name"
+    echo "skill $name: $repo@${sha:0:7}"
+  done < skill-library.txt
 }
 
 # Build prompts/<id>.md for every agent; print the ids whose prompt changed.
@@ -182,7 +218,9 @@ build_prompts() {
       [ "${kind:-team}" = team ] && [ -f prompts/src/_team.md ] && { cat prompts/src/_team.md; echo; }
       [ -f prompts/src/_turns.md ] && { cat prompts/src/_turns.md; echo; }
       [ -f prompts/src/_files.md ] && { cat prompts/src/_files.md; echo; }
+      [ -f prompts/src/_proof.md ] && { cat prompts/src/_proof.md; echo; }
       [ "$rt" = claude ] && [ -f prompts/src/_delegate.md ] && { cat prompts/src/_delegate.md; echo; }
+      [ "$rt" = codex ] && [ -f prompts/src/_delegate-codex.md ] && { cat prompts/src/_delegate-codex.md; echo; }
       [ "$rt" = codex ] && [ -s "$id.listen" ] && [ -f prompts/src/_ambient.md ] && { cat prompts/src/_ambient.md; echo; }
       cat prompts/_roster.md; echo
       [ -f prompts/src/_instructions.md ] && cat prompts/src/_instructions.md
@@ -288,11 +326,11 @@ login_codex() {
 cmd=${1:-list}; shift || true
 case "$cmd" in
   list)
-    printf "%-10s %-7s %-16s %-22s %s\n" ID RUNTIME MODEL STATUS NPUB
-    while read -r id rt _; do
+    printf "%-10s %-7s %-16s %-5s %-22s %s\n" ID RUNTIME MODEL MEM STATUS NPUB
+    while read -r id rt mem _; do
       [ -z "${id:-}" ] && continue
       st=$(docker inspect -f '{{.State.Status}}' "buzz-agents-$id-1" 2>/dev/null | head -1 || true); [ -n "$st" ] || st="not created"
-      printf "%-10s %-7s %-16s %-22s %s\n" "$id" "$rt" "$(model_of "$id" | tr ' ' /)" "$st" "$(npub "$(cat "$id.pub")")"
+      printf "%-10s %-7s %-16s %-5s %-22s %s\n" "$id" "$rt" "$(model_of "$id" | tr ' ' /)" "$mem" "$st" "$(npub "$(cat "$id.pub")")"
     done < agents.list ;;
 
   model)
@@ -302,6 +340,31 @@ case "$cmd" in
     if [ ${#pos[@]} -eq 0 ]; then read -r m e <<<"$(model_of "$id")"; echo "$id: model $m, effort $e"; exit 0; fi
     set_model "$id" "${pos[0]}" "${pos[1]:--}"
     if [ $restart = 1 ]; then dc up -d --force-recreate "$id" 2>&1 | grep -E "Started|Error" || true; fi ;;
+
+  mem)
+    id=${1:?id}; [ -n "$(runtime_of "$id")" ] || die "no agent $id"
+    if [ -z "${2:-}" ]; then echo "$id: memory limit $(awk -v id="$id" '$1==id{print $3}' agents.list)"; exit 0; fi
+    [[ "$2" =~ ^[0-9]+[mg]$ ]] || die "size like 4g or 3584m"
+    awk -v id="$id" -v m="$2" '$1==id{$3=m}1' agents.list > agents.list.new && mv agents.list.new agents.list
+    render
+    echo "$id: memory limit $2"
+    if [ "${3:-}" != --no-restart ]; then dc up -d "$id" 2>&1 | grep -E "Recreated|Started|Error" || true; fi ;;
+
+  skills)
+    id=${1:?id}; shift; [ -n "$(runtime_of "$id")" ] || die "no agent $id"
+    restart=1; names=()
+    for a in "$@"; do [ "$a" = --no-restart ] && restart=0 || names+=("$a"); done
+    if [ ${#names[@]} -eq 0 ]; then
+      echo "$id: $(cat "$id.skills" 2>/dev/null || echo none) (+ $(ls skills | tr '\n' ' ')for everyone)"
+      echo "available: $(ls skill-library 2>/dev/null | tr '\n' ' ')"; exit 0
+    fi
+    [ "${names[*]}" = none ] && names=()
+    for n in "${names[@]}"; do [ -f "skill-library/$n/SKILL.md" ] || die "no skill $n (see skill-library.txt; agentctl skills-fetch)"; done
+    if [ ${#names[@]} -gt 0 ]; then echo "${names[*]}" > "$id.skills"; else rm -f "$id.skills"; fi
+    render
+    echo "$id skills: ${names[*]:-none}"
+    if [ $restart = 1 ]; then dc up -d "$id" 2>&1 | grep -E "Recreated|Started|Error" || true; fi ;;
+  skills-fetch) fetch_skills ;;
 
   runtime)
     id=${1:?id}; new=${2:?runtime}; [[ "$new" =~ ^(claude|codex)$ ]] || die "runtime must be claude or codex"
@@ -379,7 +442,7 @@ case "$cmd" in
     if [ "${2:-}" = --purge ]; then
       docker volume rm "buzz-agents_$id-home" "buzz-agents_$id-ws" >/dev/null 2>&1 || true
       docker network rm "buzz-agents_$id-net" >/dev/null 2>&1 || true
-      rm -f "$id.env" "$id.pub" "$id.meta" "prompts/src/$id.md"; echo "removed $id (key, volumes and prompt deleted)"
+      rm -f "$id.env" "$id.pub" "$id.meta" "$id.skills" "prompts/src/$id.md"; echo "removed $id (key, volumes and prompt deleted)"
     else echo "removed $id (key and volumes kept in /opt/buzz-agents)"; fi
     sync_prompts ;;
   render) render ;;

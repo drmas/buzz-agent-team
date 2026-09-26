@@ -9,7 +9,8 @@
 //
 // Hook form: prints nothing (let the turn run) or {"decision":"block",...} (end the turn before the
 // model sees it: zero tokens, no reply). Only prompts whose events are *all* ambient are checked;
-// mentions, DMs, check-ins and interactive sessions always pass.
+// mentions, DMs, check-ins and interactive sessions always pass, and so does any message that
+// writes "@<this agent's name>".
 // Manual form: prints `REPLY: <reason>` or `SKIP: <reason>`.
 //
 // Classifier (AMBIENT_GATE, default auto): `jev` = TypeSafe's Jev (needs TYPESAFE_API_KEY), `haiku` =
@@ -146,6 +147,9 @@ async function main() {
 
   const agent = self();
   if (!agent) return pass('gate off (AGENT_PUBKEY not in roster)', where);
+  // "@Name" typed without picking the mention (no p tag) still addresses this agent.
+  const esc = agent.name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  if (input.messages.some((m) => new RegExp(`@${esc}(?![\\w-])`, 'i').test(m.text))) return pass('named in message', where);
 
   const state = {
     agent,

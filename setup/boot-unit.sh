@@ -1,7 +1,6 @@
-# Start agents on every boot (restart: on-failure alone doesn't survive a reboot reliably),
-# and size memory limits for an 8 GB host.
+# Start agents on every boot (restart: on-failure alone doesn't survive a reboot reliably).
+# Memory limits are per agent in agents.list (agentctl mem <id> <size>).
 set -euo pipefail
-sed -i 's/mem_limit: 4g/mem_limit: 3g/' /opt/buzz-agents/compose.yml
 cat > /etc/systemd/system/buzz-agents.service <<'UNIT'
 [Unit]
 Description=Buzz agent containers

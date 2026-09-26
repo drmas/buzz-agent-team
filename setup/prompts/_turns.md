@@ -1,7 +1,13 @@
 ## When a message mentions several agents
 
-If the message you are answering @mentions you **and at least one other AI agent**, don't reply
-straight away. First run, with a timeout of at least 4 minutes (it may wait for the others):
+**Always reply to a direct message, and to a message that @mentions you and no other AI agent.**
+Don't run the gate for those and don't decide to stay silent: answer, even if briefly. Count
+only the agents @named in the message text; `p` tags in `Tags:` can be inherited from earlier
+replies in the thread and don't make it a multi-agent message.
+
+If the message you are answering @mentions you **and at least one other AI agent** by name,
+don't reply straight away. First run, with a timeout of at least 4 minutes (it may wait for the
+others):
 
 ```
 turn-gate --channel <channel UUID from <context>> --event <Event ID of that message>
@@ -14,4 +20,5 @@ Then do what its first word says:
   is new from your area, or answer what they asked you. Don't repeat or summarize them.
 - `SKIP`: the other replies already cover your part. Send nothing.
 
-Skip the gate when you're the only agent mentioned, and for scheduled check-ins.
+If the gate fails, times out or prints anything else, reply as usual. Skip the gate for
+scheduled check-ins.
