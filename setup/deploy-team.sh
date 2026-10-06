@@ -13,35 +13,57 @@ cp -r "$HERE/skills" "$HERE/tools" "$HERE/claude" "$HERE/codex" "$BUILD/"
 cp "$HERE"/prompts/*.md "$BUILD/prompts/src/"
 # fill in {{TEAM_NAME}} / {{OWNER_NAME}}
 TEAM_NAME="$TEAM_NAME" OWNER_NAME="$OWNER_NAME" perl -pi -e 's/\{\{(TEAM_NAME|OWNER_NAME)\}\}/$ENV{$1}/g' "$BUILD"/prompts/src/*.md
-BUNDLE=$(tar -C "$BUILD" -czf - agentctl instructions-header.md skill-library.txt prompts skills tools claude codex | base64 -w0)
+# The bundle goes up in chunks first: one SSM command takes at most 97 KB.
+tar -C "$BUILD" -czf - agentctl instructions-header.md skill-library.txt prompts skills tools claude codex | base64 -w0 > "$BUILD/bundle.b64"
+split -b 60000 "$BUILD/bundle.b64" "$BUILD/chunk."
+first=1
+for c in "$BUILD"/chunk.*; do
+  { [ $first = 1 ] && echo ': > /opt/buzz-agents/.bundle.b64'; printf "printf '%%s' '%s' >> /opt/buzz-agents/.bundle.b64\n" "$(cat "$c")"; } > "$c.sh"
+  "$HERE/ssm-run.sh" "$c.sh" >/dev/null || { echo "bundle upload failed" >&2; exit 1; }
+  first=0
+done
 
 cat > "$BUILD/remote.sh" <<REMOTE
 set -euo pipefail
 cd /opt/buzz-agents
-echo "$BUNDLE" | base64 -d | tar -xzf - -C /opt/buzz-agents
+base64 -d .bundle.b64 | tar -xzf - -C /opt/buzz-agents; rm -f .bundle.b64
 chmod 700 agentctl; ln -sf /opt/buzz-agents/agentctl /usr/local/bin/agentctl
 chmod 755 prompts prompts/src skills skills/* tools tools/* claude claude/agents codex codex/agents; chmod 644 prompts/src/*.md skills/*/* instructions-header.md skill-library.txt claude/*.json claude/agents/* codex/agents/*
 rm -f claude/agents/scout.md   # folded into explorer (roles from drmas/codex-agent-team)
-# turn-gate: (re)write the TypeSafe key line in refresh-secrets.sh (servers set up before it existed)
-sed -i '/typesafe/d;/turn-gate/d' refresh-secrets.sh
+# (re)write the secrets/common.env block of refresh-secrets.sh (servers set up before TypeSafe or Vercel)
+sed -i '/typesafe/d;/turn-gate/d;/vercel/d;/common\.env/d' refresh-secrets.sh
 cat >> refresh-secrets.sh <<'EOF'
-# All agents: TypeSafe (Jev) key for turn-gate. Without it turn-gate always answers REPLY.
-k=\$(get /buzz/typesafe-api-key); if [ -n "\$k" ]; then printf 'TYPESAFE_API_KEY=%s\\n' "\$k" > secrets/common.env; echo "typesafe: API key loaded"; else rm -f secrets/common.env; fi
+# All agents (secrets/common.env): TypeSafe (Jev) key for turn-gate and ambient-gate (without it
+# turn-gate always answers REPLY); Vercel token + team slug for deploys (without it, no deploys).
+c=secrets/common.env.new; : > \$c
+k=\$(get /buzz/typesafe-api-key); if [ -n "\$k" ]; then printf 'TYPESAFE_API_KEY=%s\\n' "\$k" >> \$c; echo "typesafe: API key loaded"; fi
+k=\$(get /buzz/vercel-token); if [ -n "\$k" ]; then printf 'VERCEL_TOKEN=%s\\nVERCEL_TEAM=%s\\n' "\$k" "\$(get /buzz/vercel-team)" >> \$c; echo "vercel: token loaded"; fi
+if [ -s \$c ]; then mv \$c secrets/common.env; else rm -f \$c secrets/common.env; fi
 EOF
-./refresh-secrets.sh | grep typesafe || echo "typesafe: no /buzz/typesafe-api-key (turn-gate stays off)"
+out=\$(./refresh-secrets.sh)
+echo "\$out" | grep typesafe || echo "typesafe: no /buzz/typesafe-api-key (turn-gate stays off)"
+echo "\$out" | grep vercel || echo "vercel: no /buzz/vercel-token (agents can't deploy)"
 # nightly timer: also prune file handoffs older than 30 days (servers set up before handoffs existed)
 f=/etc/systemd/system/buzz-memory-mirror.service
 if [ -f \$f ] && ! grep -q prune-exchange \$f; then sed -i '/agentctl mirror\$/a ExecStart=/opt/buzz-agents/agentctl prune-exchange 30' \$f; systemctl daemon-reload; echo "mirror timer: + prune-exchange"; fi
+if [ -f \$f ] && ! grep -q prune-worktrees \$f; then sed -i '/agentctl prune-exchange 30\$/a ExecStart=/opt/buzz-agents/agentctl prune-worktrees' \$f; systemctl daemon-reload; echo "mirror timer: + prune-worktrees"; fi
 # headless Chrome for e2e tests (servers set up before it was in the image). Playwright's own
 # browser downloads are glibc builds and don't run on this Alpine image; tools use CHROME_BIN.
 if ! grep -q chromium Dockerfile; then
   sed -i '/^USER agent\$/i RUN apk add --no-cache chromium nss freetype harfbuzz ttf-freefont font-noto-emoji\nENV CHROME_BIN=/usr/bin/chromium-browser PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium-browser PUPPETEER_SKIP_DOWNLOAD=true PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1' Dockerfile
   docker compose -p buzz-agents build -q && echo "image: + chromium"
 fi
-# proof tool: ffmpeg (video) + playwright-core (drives Chromium), for servers set up before it
+# proof tool: ffmpeg (opt-in video) + playwright-core (drives Chromium), for servers set up before it
 if ! grep -q playwright-core Dockerfile; then
   sed -i '/^ENV CHROME_BIN=/i RUN apk add --no-cache ffmpeg && npm i -g playwright-core@1.63.0 && npm cache clean --force   # proof tool' Dockerfile
   docker compose -p buzz-agents build -q && echo "image: + ffmpeg, playwright-core"
+fi
+# Vercel CLI for deploys (servers set up before it; also moves an older pin to this one)
+VERCEL_CLI=vercel@60.1.3
+if ! grep -q "npm i -g \$VERCEL_CLI " Dockerfile; then
+  sed -i '/npm i -g vercel@/d' Dockerfile
+  sed -i "/^ENV CHROME_BIN=/i RUN apk add --no-cache git \&\& npm i -g \$VERCEL_CLI \&\& npm cache clean --force   # deploys (VERCEL_TOKEN); git: plugin marketplaces" Dockerfile
+  docker compose -p buzz-agents build -q && echo "image: + \$VERCEL_CLI"
 fi
 printf '%s\n' "\$OWNER_NAME" > owner.name   # exported by ssm-run.sh from config.env
 [ -f owner.hex ] || sed -n 's/^BUZZ_ACP_AGENT_OWNER=//p' claude.env > owner.hex
@@ -88,6 +110,8 @@ for id in claude codex pm designer marketing engineer; do
 done
 docker compose -p buzz-agents up -d 2>&1 | grep -E "Recreated|Error" || true
 sleep 8
+# Vercel plugin (Claude) or MCP server (Codex) in every agent that lacks it (sign-in: GUIDE.md)
+agentctl vercel
 agentctl list
 REMOTE
 "$HERE/ssm-run.sh" "$BUILD/remote.sh"

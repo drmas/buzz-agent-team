@@ -1,0 +1,175 @@
+#!/bin/bash
+# wt — one git worktree per task, so parallel tasks (and parallel workers) never share a checkout,
+# plus cleanup so finished work doesn't pile up on disk.
+#
+#   wt new <repo|git-url> <task> [--base <ref>]   create (or reopen) the task's worktree; prints its path
+#   wt ls                                       every worktree: state, idle days, size
+#   wt done <repo>/<task> [--force]             remove a finished worktree (refuses unsaved work)
+#   wt gc [--days 14] [--slim-days 3] [--dry-run]   clean up (also runs nightly from the host)
+#
+# Layout: /workspace/repos/<repo> is the base clone (stays on the default branch, never edited);
+# /workspace/wt/<repo>/<task> is a worktree on branch <agent-id>/<task>. The agent-id prefix keeps
+# branches of different agents apart on the shared remote.
+#
+# gc removes a worktree only when nothing can be lost: no uncommitted changes and either
+#   finished: merged into the default branch, or its pushed branch was deleted on the remote
+#             (merged or closed PR); or
+#   idle:     no activity for --days and every commit is on the remote (wt new reopens it).
+# Worktrees with unsaved work are never removed: gc lists them as STALE. Worktrees idle for
+# --slim-days lose their git-ignored dependency and build folders (node_modules, .next, dist…),
+# which a reinstall brings back. Base clones with no worktrees and no local-only work for 60 days
+# are removed too.
+set -uo pipefail
+WS=${WT_ROOT:-/workspace}
+REPOS="$WS/repos" TREES="$WS/wt"
+ME=${AGENT_ID:-agent}
+SLIM_DIRS="node_modules .next .nuxt .svelte-kit .turbo .parcel-cache .cache dist build out coverage target .venv venv __pycache__ .pytest_cache"
+die() { echo "wt: $*" >&2; exit 1; }
+now=$(date +%s)
+g() { git -C "$1" "${@:2}"; }
+
+default_branch() {  # repo dir
+  local b; b=$(g "$1" symbolic-ref -q --short refs/remotes/origin/HEAD 2>/dev/null) \
+    || { g "$1" remote set-head origin -a >/dev/null 2>&1; b=$(g "$1" symbolic-ref -q --short refs/remotes/origin/HEAD 2>/dev/null); }
+  echo "${b:-origin/main}"
+}
+
+idle_days() {  # worktree dir: days since the last commit, staging, checkout or file save git noticed
+  local gd t newest=0 f
+  gd=$(g "$1" rev-parse --absolute-git-dir 2>/dev/null) || { echo 999; return; }
+  for f in "$gd/index" "$gd/HEAD" "$gd/logs/HEAD" "$gd/wt-meta"; do
+    [ -e "$f" ] && { t=$(stat -c %Y "$f"); [ "$t" -gt "$newest" ] && newest=$t; }
+  done
+  t=$(g "$1" log -1 --format=%ct 2>/dev/null || echo 0); [ "${t:-0}" -gt "$newest" ] && newest=$t
+  echo $(( (now - newest) / 86400 ))
+}
+
+# state of a worktree: dirty | empty (no commits yet) | unpushed:<n> | merged | gone | pushed
+state() {  # worktree dir
+  local w=$1 br def up n base head
+  [ -n "$(g "$w" status --porcelain 2>/dev/null)" ] && { echo dirty; return; }
+  br=$(g "$w" symbolic-ref -q --short HEAD) || br=""
+  def=$(default_branch "$w")
+  base=$(sed -n 's/^base=//p' "$(g "$w" rev-parse --absolute-git-dir)/wt-meta" 2>/dev/null)
+  head=$(g "$w" rev-parse HEAD)
+  { [ "$head" = "${base:-}" ] || [ "$head" = "$(g "$w" rev-parse "$def")" ]; } && { echo empty; return; }
+  g "$w" merge-base --is-ancestor HEAD "$def" 2>/dev/null && { echo merged; return; }
+  if [ -n "$br" ] && up=$(g "$w" config "branch.$br.merge" 2>/dev/null) && ! g "$w" rev-parse -q --verify "refs/remotes/origin/${up#refs/heads/}" >/dev/null; then
+    echo gone; return   # pushed once, since deleted on the remote: merged (squash) or closed PR
+  fi
+  n=$(g "$w" rev-list --count HEAD --not --remotes 2>/dev/null || echo 1)
+  [ "$n" -gt 0 ] && { echo "unpushed:$n"; return; }
+  echo pushed
+}
+
+each_tree() {  # prints "<repo> <task> <dir>" for every worktree
+  local d
+  for d in "$TREES"/*/*/; do [ -e "$d.git" ] && { d=${d%/}; echo "$(basename "$(dirname "$d")") $(basename "$d") $d"; }; done
+}
+
+remove_tree() {  # repo task dir [force]: callers check first that nothing unsaved is lost
+  local base="$REPOS/$1" br
+  br=$(g "$3" symbolic-ref -q --short HEAD) || br=""
+  g "$base" worktree remove ${4:+--force} "$3" || return 1
+  [ -n "$br" ] && g "$base" branch -q -D "$br" 2>/dev/null   # merged, closed or still on the remote
+  rmdir "$TREES/$1" 2>/dev/null; return 0
+}
+
+cmd=${1:-help}; shift || true
+case "$cmd" in
+  new)
+    src=${1:?usage: wt new <repo|git-url> <task> [--base <ref>]}; task=${2:?task name}; shift 2
+    base_ref=""; [ "${1:-}" = --base ] && base_ref=${2:?ref}
+    [[ "$task" =~ ^[a-z0-9][a-z0-9-]{0,48}$ ]] || die "task: lowercase letters, digits and dashes (e.g. dark-mode-toggle)"
+    if [[ "$src" == */* || "$src" == *:* ]]; then repo=$(basename "${src%.git}"); else repo=$src; fi
+    [[ "$repo" =~ ^[A-Za-z0-9._-]+$ ]] || die "bad repo name: $repo"
+    mkdir -p "$REPOS" "$TREES/$repo"
+    if [ ! -d "$REPOS/$repo/.git" ]; then
+      [ "$repo" != "$src" ] || die "no clone of $repo yet: pass its git URL the first time"
+      git clone -q "$src" "$REPOS/$repo" || die "clone failed"
+    fi
+    b="$REPOS/$repo"; dir="$TREES/$repo/$task"; br="$ME/$task"
+    g "$b" fetch -q --prune origin || echo "wt: fetch failed, using what's local" >&2
+    if [ -e "$dir/.git" ]; then echo "$dir"; exit 0; fi
+    if g "$b" rev-parse -q --verify "refs/heads/$br" >/dev/null; then
+      g "$b" worktree add -q "$dir" "$br" || die "worktree add failed"
+    elif g "$b" rev-parse -q --verify "refs/remotes/origin/$br" >/dev/null; then
+      g "$b" worktree add -q --track -b "$br" "$dir" "origin/$br" || die "worktree add failed"   # reopen pushed work
+    else
+      g "$b" worktree add -q --no-track -b "$br" "$dir" "${base_ref:-$(default_branch "$b")}" || die "worktree add failed"
+    fi
+    printf 'created=%s\nbase=%s\n' "$(date -u +%FT%TZ)" "$(g "$dir" rev-parse HEAD)" > "$(g "$dir" rev-parse --absolute-git-dir)/wt-meta"
+    # other agents' recent branches on this repo: check them before touching the same files
+    others=$(g "$b" for-each-ref --sort=-committerdate --format='%(committerdate:unix) %(refname:lstrip=3)' refs/remotes/origin \
+      | awk -v me="$ME/" -v cut=$((now - 14*86400)) '$1 >= cut && $2 ~ /\// && index($2, me) != 1 {print $2}' | head -8 | tr '\n' ' ')
+    [ -n "$others" ] && echo "wt: others active on $repo (last 14 days): $others" >&2
+    echo "$dir" ;;
+
+  ls)
+    printf '%-40s %-14s %5s %7s\n' "REPO/TASK" "STATE" "IDLE" "SIZE"
+    each_tree | while read -r repo task dir; do
+      printf '%-40s %-14s %4sd %7s\n' "$repo/$task" "$(state "$dir")" "$(idle_days "$dir")" "$(du -sh "$dir" 2>/dev/null | cut -f1)"
+    done ;;
+
+  done)
+    t=${1:?usage: wt done <repo>/<task> [--force]}; force=""; [ "${2:-}" = --force ] && force=force
+    dir="$TREES/$t"; [ -e "$dir/.git" ] || die "no worktree $t (see wt ls)"
+    g "$dir" fetch -q --prune origin 2>/dev/null
+    s=$(state "$dir")
+    if [ -z "$force" ]; then
+      case "$s" in
+        dirty) die "$t has uncommitted changes: commit and push them, or pass --force to discard" ;;
+        unpushed:*) die "$t has ${s#unpushed:} commit(s) on no remote: push them, or pass --force to discard" ;;
+      esac
+    fi
+    remove_tree "${t%%/*}" "${t#*/}" "$dir" "$force" && echo "removed $t ($s)" ;;
+
+  gc)
+    days=14 slim=3 dry=""
+    while [ $# -gt 0 ]; do case "$1" in
+      --days) days=$2; shift 2 ;; --slim-days) slim=$2; shift 2 ;; --dry-run) dry=1; shift ;; *) die "gc: unknown option $1" ;;
+    esac; done
+    before=$(du -sk "$WS" 2>/dev/null | cut -f1)
+    for b in "$REPOS"/*/; do [ -d "$b.git" ] && g "$b" fetch -q --prune origin 2>/dev/null; done
+    removed=0 stale=""
+    while read -r repo task dir; do
+      [ -n "$repo" ] || continue
+      s=$(state "$dir"); idle=$(idle_days "$dir")
+      if [ "$s" = merged ] || [ "$s" = gone ] || { [[ "$s" == pushed || "$s" == empty ]] && [ "$idle" -ge "$days" ]; }; then
+        echo "remove $repo/$task ($s, idle ${idle}d)"
+        [ -n "$dry" ] || { remove_tree "$repo" "$task" "$dir" && removed=$((removed + 1)); }
+        continue
+      fi
+      [ "$idle" -ge "$days" ] && stale="$stale $repo/$task($s,${idle}d)"
+      if [ "$idle" -ge "$slim" ]; then
+        for n in $SLIM_DIRS; do
+          find "$dir" -maxdepth 4 -type d -name "$n" -prune 2>/dev/null | while read -r p; do
+            g "$dir" check-ignore -q "$p" || continue   # only folders git ignores: never tracked files
+            echo "slim $repo/$task: ${p#"$dir"/}"; [ -n "$dry" ] || rm -rf "$p"
+          done
+        done
+      fi
+    done < <(each_tree)
+    for b in "$REPOS"/*/; do
+      [ -d "$b.git" ] || continue; b=${b%/}
+      g "$b" worktree prune
+      # local task branches with no worktree whose commits are all on the remote
+      g "$b" for-each-ref --format='%(refname:short)' "refs/heads/$ME/" | while read -r br; do
+        g "$b" worktree list --porcelain | grep -qx "branch refs/heads/$br" && continue
+        [ "$(g "$b" rev-list --count "$br" --not --remotes)" = 0 ] && { echo "drop branch $(basename "$b"):$br"; [ -n "$dry" ] || g "$b" branch -q -D "$br"; }
+      done
+      # a base clone nobody has used for 60 days, with nothing that exists only here
+      last=$(stat -c %Y "$b/.git/FETCH_HEAD" "$b/.git/HEAD" 2>/dev/null | sort -n | tail -1)
+      if [ "$(g "$b" worktree list | wc -l)" = 1 ] && [ -z "$(g "$b" status --porcelain)" ] \
+         && [ "$(g "$b" rev-list --count --branches --not --remotes)" = 0 ] && [ $(( (now - ${last:-0}) / 86400 )) -ge 60 ]; then
+        echo "remove clone $(basename "$b") (unused 60d)"; [ -n "$dry" ] || { rm -rf "$b"; rmdir "$TREES/$(basename "$b")" 2>/dev/null; continue; }
+      fi
+      [ -n "$dry" ] || g "$b" gc --auto --quiet
+    done
+    after=$(du -sk "$WS" 2>/dev/null | cut -f1)
+    echo "wt gc: removed $removed worktree(s), freed $(( (${before:-0} - ${after:-0}) / 1024 )) MB${dry:+ (dry run)}"
+    [ -n "$stale" ] && echo "STALE, unsaved work kept (push it or wt done --force):$stale"
+    exit 0 ;;
+
+  *) sed -n '2,21p' "$0" | sed 's/^# \{0,1\}//'; [ "$cmd" = help ] ;;
+esac

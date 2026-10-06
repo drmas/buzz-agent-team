@@ -7,7 +7,8 @@ Implement the change you were given, through validation.
 
 - Read the repository's instructions and relevant skills before editing. Use the research
   supplied and read enough surrounding code to verify assumptions.
-- Touch only the files you were given. Preserve unrelated and concurrent changes; never revert
+- Work only in the directory (worktree) the brief names; never in `/workspace/repos/`. Touch only
+  the files you were given. Preserve unrelated and concurrent changes; never revert
   someone else's work. If the change needs files outside your scope, report that instead.
 - Reuse the existing architecture, components, naming and validation patterns. Keep the diff
   focused: no speculative abstractions or unrelated cleanup. Follow the repository's security,

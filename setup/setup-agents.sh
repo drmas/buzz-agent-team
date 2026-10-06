@@ -19,6 +19,7 @@ RUN apk add --no-cache nodejs npm ripgrep \
  && npm cache clean --force
 RUN apk add --no-cache chromium nss freetype harfbuzz ttf-freefont font-noto-emoji
 RUN apk add --no-cache ffmpeg && npm i -g playwright-core@1.63.0 && npm cache clean --force   # proof tool
+RUN apk add --no-cache git && npm i -g vercel@60.1.3 && npm cache clean --force   # deploys (VERCEL_TOKEN); git: plugin marketplaces
 ENV CHROME_BIN=/usr/bin/chromium-browser PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium-browser PUPPETEER_SKIP_DOWNLOAD=true PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
 USER agent
 EOF
@@ -91,8 +92,12 @@ elif [ -n "$a" ]; then printf 'ANTHROPIC_API_KEY=%s\n' "$a" > secrets/claude.env
 else echo "claude: no /buzz/claude-oauth-token or /buzz/anthropic-api-key"; fi
 # Codex: ChatGPT login lives in the codex-home volume (~/.codex/auth.json); API key is optional.
 k=$(get /buzz/openai-api-key); [ -n "$k" ] && printf 'OPENAI_API_KEY=%s\n' "$k" > secrets/codex.env && echo "codex: API key loaded" || true
-# All agents: TypeSafe (Jev) key for turn-gate. Without it turn-gate always answers REPLY.
-k=$(get /buzz/typesafe-api-key); if [ -n "$k" ]; then printf 'TYPESAFE_API_KEY=%s\n' "$k" > secrets/common.env; echo "typesafe: API key loaded"; else rm -f secrets/common.env; fi
+# All agents (secrets/common.env): TypeSafe (Jev) key for turn-gate and ambient-gate (without it
+# turn-gate always answers REPLY); Vercel token + team slug for deploys (without it, no deploys).
+c=secrets/common.env.new; : > $c
+k=$(get /buzz/typesafe-api-key); if [ -n "$k" ]; then printf 'TYPESAFE_API_KEY=%s\n' "$k" >> $c; echo "typesafe: API key loaded"; fi
+k=$(get /buzz/vercel-token); if [ -n "$k" ]; then printf 'VERCEL_TOKEN=%s\nVERCEL_TEAM=%s\n' "$k" "$(get /buzz/vercel-team)" >> $c; echo "vercel: token loaded"; fi
+if [ -s $c ]; then mv $c secrets/common.env; else rm -f $c secrets/common.env; fi
 EOF
 chmod 700 refresh-secrets.sh
 

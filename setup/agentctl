@@ -19,11 +19,13 @@
 #   agentctl mirror [id ...]           # copy each agent's ~/memory into its Buzz memory (nightly timer)
 #   agentctl listen <id> [channel-name ...]  # channels where the agent reads every human message (none = mentions only)
 #   agentctl prune-exchange [days]     # delete handoffs older than N days (default 30; nightly timer)
+#   agentctl prune-worktrees [id ...] [--days N] [--dry-run]   # wt gc in each agent: drop finished/idle worktrees (nightly timer)
+#   agentctl vercel [id ...]           # install the Vercel plugin (Claude) / MCP server (Codex) where missing
 #
 # Registry: agents.list ("<id> <runtime> <mem> <kind>"); <id>.meta = display name / about.
-# Prompt sources: prompts/src/<id>.md (role), _team.md (team agents only), _turns.md, _people.md
-# (humans + company, edit by hand), _instructions.md, _files.md, _proof.md, _delegate.md (Claude agents),
-# _delegate-codex.md (Codex agents), _ambient.md (Codex agents that listen). Built per agent into prompts/<id>.md (mounted read-only at /prompts)
+# Prompt sources: prompts/src/<id>.md (role), _team.md (team agents only), _replies.md, _turns.md, _people.md
+# (humans + company, edit by hand), _instructions.md, _files.md, _worktrees.md, _proof.md, _delegate.md (Claude agents),
+# _delegate-codex.md (Codex agents), _ambient.md (Codex agents that listen), _deploy.md. Built per agent into prompts/<id>.md (mounted read-only at /prompts)
 # with an auto-generated "Who's who" roster.
 # Model and effort live in <id>.env: ANTHROPIC_MODEL + CLAUDE_CODE_EFFORT_LEVEL (Claude) or
 # CODEX_CONFIG={"model":…,"model_reasoning_effort":…} (Codex). Claude agents also get
@@ -32,6 +34,9 @@
 # ones listed in <id>.skills come from skill-library/ (see skill-library.txt).
 # File handoffs: exchange/<id>/ is the agent's /outbox (only it can write there); the whole
 # exchange/ is mounted read-only at /exchange in every agent (see tools/handoff).
+# Vercel: the CLI is in the image and VERCEL_TOKEN / VERCEL_TEAM come from secrets/common.env;
+# `agentctl vercel` adds the Vercel plugin (skills, subagents, MCP) to Claude agents and the Vercel
+# MCP server to Codex agents, in their own home. The MCP sign-in is per agent (GUIDE.md).
 set -euo pipefail
 DIR=/opt/buzz-agents
 cd "$DIR"
@@ -98,6 +103,7 @@ EOF
       echo "      BUZZ_ACP_MAX_TURNS_PER_SESSION: \"40\"     # fresh context every 40 turns; memory carries continuity"
       echo "      AGENT_PUBKEY: \"$(cat "$id.pub")\"   # turn-gate: which roster row is me"
       echo "      AGENT_ID: $id                             # handoff: /outbox is /exchange/$id for the others"
+      echo "      VERCEL_PLUGIN_TELEMETRY: \"off\"          # Vercel plugin: no usage pings"
       if [ "$rt" = claude ]; then
         echo "      CLAUDE_CODE_EXECUTABLE: /usr/local/bin/claude"
         echo "      DISABLE_AUTOUPDATER: \"1\""
@@ -113,7 +119,7 @@ EOF
       echo "    env_file:"
       echo "      - $id.env"
       echo "      - { path: secrets/$rt.env, required: false }"
-      echo "      - { path: secrets/common.env, required: false }   # TYPESAFE_API_KEY (turn-gate, ambient-gate)"
+      echo "      - { path: secrets/common.env, required: false }   # TYPESAFE_API_KEY (gates), VERCEL_TOKEN + VERCEL_TEAM (deploys)"
       echo "    volumes:"
       echo "      - $id-home:/home/agent"
       echo "      - $id-ws:/workspace"
@@ -216,9 +222,12 @@ build_prompts() {
     {
       [ -f "prompts/src/$id.md" ] && { cat "prompts/src/$id.md"; echo; }
       [ "${kind:-team}" = team ] && [ -f prompts/src/_team.md ] && { cat prompts/src/_team.md; echo; }
+      [ -f prompts/src/_replies.md ] && { cat prompts/src/_replies.md; echo; }
       [ -f prompts/src/_turns.md ] && { cat prompts/src/_turns.md; echo; }
       [ -f prompts/src/_files.md ] && { cat prompts/src/_files.md; echo; }
+      [ -f prompts/src/_worktrees.md ] && { cat prompts/src/_worktrees.md; echo; }
       [ -f prompts/src/_proof.md ] && { cat prompts/src/_proof.md; echo; }
+      [ -f prompts/src/_deploy.md ] && { cat prompts/src/_deploy.md; echo; }
       [ "$rt" = claude ] && [ -f prompts/src/_delegate.md ] && { cat prompts/src/_delegate.md; echo; }
       [ "$rt" = codex ] && [ -f prompts/src/_delegate-codex.md ] && { cat prompts/src/_delegate-codex.md; echo; }
       [ "$rt" = codex ] && [ -s "$id.listen" ] && [ -f prompts/src/_ambient.md ] && { cat prompts/src/_ambient.md; echo; }
@@ -323,6 +332,27 @@ login_codex() {
   docker logs "login-$1" 2>&1 | sed 's/\x1b\[[0-9;]*m//g' | grep -E "https://|^[[:space:]]+[A-Z0-9]{4}-[A-Z0-9]{4,}" || echo "(no code yet: docker logs login-$1)"
 }
 
+# Vercel plugin (Claude agents: skills, subagents, commands and the MCP server, from the official
+# Claude plugin marketplace; what `npx plugins add vercel/vercel-plugin` installs) or the Vercel MCP
+# server alone (Codex agents: the plugin isn't in Codex's marketplace). Purchase tools are blocked:
+# claude/managed-settings.json and disabled_tools below. Prints the ids it changed.
+VERCEL_MCP_URL=https://mcp.vercel.com
+add_vercel() {  # id
+  local id=$1 x="dc exec -T $1"
+  if ! $x true </dev/null >/dev/null 2>&1; then echo "warning: $id not running, Vercel not added" >&2; return 0; fi
+  if [ "$(runtime_of "$id")" = claude ]; then
+    [[ "$($x claude plugin list </dev/null 2>/dev/null)" == *vercel@claude-plugins-official* ]] && return 0   # not grep -q: SIGPIPE + pipefail
+    { $x claude plugin marketplace add https://github.com/anthropics/claude-plugins-official.git </dev/null >/dev/null 2>&1 || true
+      $x claude plugin install --scope user vercel@claude-plugins-official </dev/null >/dev/null 2>&1; } \
+      || { echo "warning: Vercel plugin not installed for $id" >&2; return 0; }
+  else
+    $x sh -c 'grep -qs "^\[mcp_servers\.vercel\]" ~/.codex/config.toml' </dev/null && return 0
+    $x sh -c 'mkdir -p ~/.codex && printf "\n[mcp_servers.vercel]   # sign in: codex mcp login vercel\nurl = \"%s\"\ndisabled_tools = [\"buy_pro\", \"buy_credits\", \"buy_addon\", \"buy_domain\"]\n" "$0" >> ~/.codex/config.toml' "$VERCEL_MCP_URL" </dev/null \
+      || { echo "warning: Vercel MCP not added for $id" >&2; return 0; }
+  fi
+  echo "$id"
+}
+
 cmd=${1:-list}; shift || true
 case "$cmd" in
   list)
@@ -422,6 +452,7 @@ case "$cmd" in
     prep_home "$id" "$rt"
     sync_prompts   # builds the new agent's prompt, starts it, and restarts others (roster changed)
     set_profile "$id" "$name" "$about"
+    [ -z "$(add_vercel "$id")" ] || dc up -d --force-recreate "$id" 2>&1 | grep -E "Error" || true
     echo "added $id ($rt): $(npub "$pk")"
     if [ "$rt" = codex ] && [ ! -s "$(docker volume inspect -f '{{.Mountpoint}}' "buzz-agents_$id-home")/.codex/auth.json" ]; then
       echo "codex sign-in needed:"; login_codex "$id"
@@ -472,6 +503,23 @@ case "$cmd" in
     days=${1:-30}; [[ "$days" =~ ^[0-9]+$ ]] || die "days must be a number"
     [ -d exchange ] || exit 0
     find exchange -mindepth 2 -maxdepth 2 -mtime +"$days" -print -exec rm -rf {} + | sed 's/^/pruned /' ;;
+  prune-worktrees)
+    ids="" opts=""
+    while [ $# -gt 0 ]; do case "$1" in --days) opts="$opts --days ${2:?days}"; shift 2 ;; --dry-run) opts="$opts --dry-run"; shift ;; *) ids="$ids $1"; shift ;; esac; done
+    for id in ${ids:-$(awk '{print $1}' agents.list)}; do
+      echo "== $id"
+      dc exec -T "$id" /opt/agent-tools/wt gc $opts </dev/null 2>&1 | tail -20 || echo "(not running)"
+    done ;;
+  vercel)
+    changed=""
+    for id in ${*:-$(awk '{print $1}' agents.list)}; do
+      [ -n "$(runtime_of "$id")" ] || die "no agent $id"
+      changed="$changed $(add_vercel "$id")"
+    done
+    if [ -n "${changed// }" ]; then
+      echo "vercel added:$changed (sign each in once: GUIDE.md, 'Vercel')"
+      dc up -d --force-recreate $changed 2>&1 | grep -E "Started|Error" || true
+    else echo "vercel: every agent has it"; fi ;;
   build) build_prompts ;;
   prep-all) while read -r i r _; do [ -n "${i:-}" ] && prep_home "$i" "$r"; done < agents.list; render ;;
   *) die "unknown command $cmd" ;;

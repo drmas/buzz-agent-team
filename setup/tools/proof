@@ -1,11 +1,19 @@
 #!/usr/bin/env node
 // proof — capture evidence that a feature works, to attach to the message that reports it.
 //
+//   proof steps <url|file> --script flow.mjs [--full]                          screenshot after every step, plus
+//                                                                              one storyboard PNG of them all
 //   proof shot  <url|file> [--script flow.mjs] [--full] [--wait <selector>]   screenshot (PNG)
-//   proof video <url|file> [--script flow.mjs] [--seconds 5]                  screen recording (MP4)
 //   proof term  [--title <text>] [--lines 60] -- <command …>                   runs the command, PNG of its output
+//   proof video <url|file> [--script flow.mjs] [--seconds 5]                  screen recording (MP4), only when
+//                                                                              motion matters: see below
 //
 // Common: --out <file> (default /workspace/proof/<time>-<kind>.<ext>), --size 1280x720, --dark.
+//
+// Video is expensive (Chromium recording + ffmpeg encoding). Only one runs at a time per container:
+// a second `proof video` waits for the first (up to 10 min). It refuses to start when the container
+// has less than 800 MB free (PROOF_VIDEO_MIN_FREE_MB), keeps frames on disk, not in memory, encodes
+// after the browser has closed, and stops at 60 s.
 //
 // A flow script drives the page while it's recorded, with captions so a viewer can follow along:
 //
@@ -37,8 +45,15 @@ const kind = args[0];
 const target = args[1] && !args[1].startsWith('--') ? args[1] : undefined;
 
 const [W, H] = (opt('size') || '1280x720').split('x').map(Number);
-const FPS = 10, MAX_SECONDS = 180;
-const EXT = { shot: 'png', video: 'mp4', term: 'png' };
+const FPS = 10, MAX_SECONDS = 60, LOCK_WAIT_MIN = 10;
+const MIN_FREE_MB = +(process.env.PROOF_VIDEO_MIN_FREE_MB || 800);
+const EXT = { shot: 'png', steps: 'png', video: 'mp4', term: 'png' };
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// Cleanup that must happen however we exit (die() calls process.exit, which skips finally blocks).
+const cleanups = [];
+process.on('exit', () => { for (const f of cleanups) try { f(); } catch {} });
+for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP']) process.on(sig, () => process.exit(130));
 
 function playwright() {
   for (const p of ['playwright-core', '/usr/local/lib/node_modules/playwright-core', '/usr/lib/node_modules/playwright-core']) {
@@ -83,16 +98,19 @@ async function caption(page, text) {
   }, text).catch(() => {});
 }
 
-async function runFlow(page, out, written) {
+// onStep(previous caption) runs before each new step: `proof steps` screenshots the finished step there.
+// Returns the caption of the last step.
+async function runFlow(page, out, written, { onStep, pause = 700 } = {}) {
   const script = opt('script');
-  if (!script) return;
+  if (!script) return '';
   const mod = await import(pathToFileURL(path.resolve(script)).href);
   const flow = mod.default || mod.flow;
   if (typeof flow !== 'function') die(`${script} must export a default async function ({ page, step, snap })`);
   let n = 0, last = '';
   const step = async (text) => {
+    if (onStep && last) await onStep(last);
     last = `${++n}. ${text}`; console.log(`step ${last}`);
-    await caption(page, last); await page.waitForTimeout(700);
+    await caption(page, last); await page.waitForTimeout(pause);
   };
   // Re-show the caption after navigations, which wipe it.
   page.on('load', () => { if (last) caption(page, last); });
@@ -101,6 +119,7 @@ async function runFlow(page, out, written) {
     await page.screenshot({ path: f, fullPage: flag('full') }); written.push(f);
   };
   await flow({ page, step, snap, caption: (t) => caption(page, t) });
+  return last;
 }
 
 async function shot() {
@@ -123,20 +142,104 @@ async function shot() {
   report(written, problems);
 }
 
+// A captioned screenshot at the end of every step: the cheap way to show a whole flow.
+async function steps() {
+  if (!target || !opt('script')) die('usage: proof steps <url|file> --script flow.mjs [--full] [--out f.png]');
+  const out = outPath(), written = [], shots = [];   // { f, label }
+  const { b, ctx, page, problems } = await browser();
+  const capture = async (label) => {
+    await page.waitForTimeout(400);   // let the step's last action settle
+    const f = out.replace(/\.png$/, `-${String(shots.length + 1).padStart(2, '0')}.png`);
+    await page.screenshot({ path: f, fullPage: flag('full') }); shots.push({ f, label });
+  };
+  let failure;
+  try {
+    await page.goto(toUrl(target), { waitUntil: 'load' });
+    if (opt('wait')) await page.waitForSelector(opt('wait'), { timeout: 30000 });
+    const last = await runFlow(page, out, written, { onStep: capture, pause: 200 });
+    if (last) await capture(last);
+  } catch (e) {
+    failure = e;   // keep what we have plus where it broke
+    const msg = `FAILED: ${String(e.message || e).split('\n')[0].slice(0, 160)}`;
+    await caption(page, msg); await capture(msg).catch(() => {});
+  }
+  try {
+    if (shots.length) await storyboard(ctx, shots, out);
+  } finally { await b.close(); }
+  if (!shots.length) die(failure ? String(failure.message || failure) : 'the flow has no step() calls: nothing captured');
+  report([out, ...shots.map((s) => s.f), ...written], problems);
+  if (failure) { console.error(`proof: the flow failed (screenshots kept): ${failure.message || failure}`); process.exit(2); }
+}
+
+// All step screenshots on one image, two per row, each with its caption above it.
+async function storyboard(ctx, shots, out) {
+  const esc = (s) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;');
+  const cols = shots.length > 1 ? 2 : 1;
+  const cells = shots.map(({ f, label }) => `<figure><figcaption>${esc(label)}</figcaption>` +
+    `<img src="data:image/png;base64,${fs.readFileSync(f).toString('base64')}"></figure>`).join('');
+  const page = await ctx.newPage();
+  try {
+    await page.setContent(`<!doctype html><meta charset="utf-8"><style>
+body{margin:0;background:#e5e7eb;font:600 20px/1.3 system-ui,sans-serif;color:#111827}
+#g{display:grid;grid-template-columns:repeat(${cols},1fr);gap:16px;padding:16px;width:${cols * W / 1.4}px;align-items:start}
+figure{margin:0}figcaption{margin:0 0 6px}img{width:100%;display:block;border:1px solid #9ca3af}
+</style><div id="g">${cells}</div>`, { waitUntil: 'load' });
+    await page.locator('#g').screenshot({ path: out });
+  } finally { await page.close(); }
+}
+
+// One video at a time per container: a lock file holding the recorder's pid.
+async function videoLock() {
+  const lock = '/tmp/proof-video.lock', deadline = Date.now() + LOCK_WAIT_MIN * 60000;
+  let told = false;
+  for (;;) {
+    try { fs.writeFileSync(lock, String(process.pid), { flag: 'wx' }); break; } catch (e) { if (e.code !== 'EEXIST') throw e; }
+    let pid = 0, age = 0;
+    try { pid = +fs.readFileSync(lock, 'utf8').trim(); age = Date.now() - fs.statSync(lock).mtimeMs; } catch { continue; }
+    let alive = !pid && age < 10000;   // just created, pid not written yet
+    if (pid) try { process.kill(pid, 0); alive = true; } catch (e) { alive = e.code === 'EPERM'; }
+    if (!alive) { fs.rmSync(lock, { force: true }); continue; }   // stale: its recorder died
+    if (Date.now() > deadline) die(`another proof video (pid ${pid}) is still running after ${LOCK_WAIT_MIN} min. Use proof steps or proof shot instead.`);
+    if (!told) { console.log(`proof: another proof video (pid ${pid}) is running; waiting for it (one at a time)`); told = true; }
+    await sleep(3000);
+  }
+  cleanups.push(() => { if (fs.readFileSync(lock, 'utf8').trim() === String(process.pid)) fs.rmSync(lock); });
+}
+
+// Memory this container can still use, in MB (cgroup v2 limit minus the non-reclaimable part in use),
+// or null when there is no limit to read.
+function freeMemMB() {
+  try {
+    const max = fs.readFileSync('/sys/fs/cgroup/memory.max', 'utf8').trim();
+    if (max === 'max') return null;
+    const used = +fs.readFileSync('/sys/fs/cgroup/memory.current', 'utf8');
+    const inactive = +(fs.readFileSync('/sys/fs/cgroup/memory.stat', 'utf8').match(/^inactive_file (\d+)/m) || [])[1] || 0;
+    return Math.round((+max - (used - inactive)) / 1048576);
+  } catch { return null; }
+}
+
 async function video() {
   if (!target) die('usage: proof video <url|file> [--script flow.mjs] [--seconds 5] [--out f.mp4]');
   if (spawnSync('ffmpeg', ['-version']).status !== 0) die('ffmpeg is not installed in this image');
+  await videoLock();
+  const free = freeMemMB();
+  if (free !== null && free < MIN_FREE_MB) die(`only ${free} MB of memory free in this container, a video needs ${MIN_FREE_MB} MB. ` +
+    'Stop dev servers, e2e runs and browsers you no longer need, or use proof steps (screenshots) instead.');
   const out = outPath(), written = [];
+  // Frames go to disk next to the proof files, not /tmp: /tmp is a tmpfs, i.e. memory.
+  const dir = fs.mkdtempSync(path.join(fs.existsSync('/workspace') ? '/workspace/proof' : path.dirname(out), '.frames-'));
+  cleanups.push(() => fs.rmSync(dir, { recursive: true, force: true }));
   const { b, ctx, page, problems } = await browser();
-  const frames = [];   // { t: seconds, data: jpeg }
+  const frames = [];   // { t: seconds, file }
   const cdp = await ctx.newCDPSession(page);
   cdp.on('Page.screencastFrame', (f) => {
-    frames.push({ t: f.metadata.timestamp, data: Buffer.from(f.data, 'base64') });
+    const file = path.join(dir, `${String(frames.length).padStart(5, '0')}.jpg`);
+    try { fs.writeFileSync(file, f.data, 'base64'); frames.push({ t: f.metadata.timestamp, file }); } catch {}
     cdp.send('Page.screencastFrameAck', { sessionId: f.sessionId }).catch(() => {});
   });
   let failure, stopped;
   try {
-    await cdp.send('Page.startScreencast', { format: 'jpeg', quality: 80, maxWidth: W, maxHeight: H });
+    await cdp.send('Page.startScreencast', { format: 'jpeg', quality: 70, maxWidth: W, maxHeight: H });
     await page.goto(toUrl(target), { waitUntil: 'load' });
     if (opt('wait')) await page.waitForSelector(opt('wait'), { timeout: 30000 });
     const limit = new Promise((_, rej) => setTimeout(() => rej(new Error(`flow ran longer than ${MAX_SECONDS}s`)), MAX_SECONDS * 1000).unref());
@@ -152,27 +255,27 @@ async function video() {
     await b.close();
   }
   if (!frames.length) die('no frames captured');
-  await encode(frames, stopped, out); written.unshift(out);
+  await encode(frames, stopped, dir, out); written.unshift(out);
   report(written, problems);
   if (failure) { console.error(`proof: the flow failed (recording kept): ${failure.message || failure}`); process.exit(2); }
 }
 
-// Screencast frames arrive only when the page changes: resample them to a constant frame rate,
-// holding the last frame until recording stopped.
-function encode(frames, stopped, out) {
+// Screencast frames arrive only when the page changes: each frame is shown until the next one
+// (the last until recording stopped), resampled to a constant frame rate. ffmpeg reads the frames
+// from disk itself, one thread, after Chromium has exited.
+function encode(frames, stopped, dir, out) {
+  const last = frames[frames.length - 1], end = Math.max(stopped, last.t) + 0.5;
+  const list = ['ffconcat version 1.0'];
+  frames.forEach((fr, i) => list.push(`file '${path.basename(fr.file)}'`,
+    `duration ${Math.max((i + 1 < frames.length ? frames[i + 1].t : end) - fr.t, 0.001).toFixed(3)}`));
+  list.push(`file '${path.basename(last.file)}'`);   // concat drops the last duration unless the file is repeated
+  fs.writeFileSync(path.join(dir, 'list.txt'), list.join('\n') + '\n');
   return new Promise((resolve, reject) => {
-    const ff = spawn('ffmpeg', ['-y', '-loglevel', 'error', '-f', 'image2pipe', '-framerate', String(FPS), '-i', '-',
-      '-vf', 'scale=trunc(iw/2)*2:trunc(ih/2)*2', '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '28',
-      '-pix_fmt', 'yuv420p', '-movflags', '+faststart', out], { stdio: ['pipe', 'inherit', 'inherit'] });
+    const ff = spawn('ffmpeg', ['-y', '-loglevel', 'error', '-f', 'concat', '-safe', '0', '-i', path.join(dir, 'list.txt'),
+      '-vf', `fps=${FPS},scale=trunc(iw/2)*2:trunc(ih/2)*2`, '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '28',
+      '-threads', '1', '-pix_fmt', 'yuv420p', '-movflags', '+faststart', out], { stdio: ['ignore', 'inherit', 'inherit'] });
     ff.on('error', reject);
     ff.on('close', (code) => (code === 0 ? resolve() : reject(new Error(`ffmpeg exited ${code}`))));
-    const start = frames[0].t, end = Math.max(stopped, frames[frames.length - 1].t) + 0.5;
-    let i = 0;
-    for (let t = start; t <= end; t += 1 / FPS) {
-      while (i + 1 < frames.length && frames[i + 1].t <= t) i++;
-      ff.stdin.write(frames[i].data);
-    }
-    ff.stdin.end();
   });
 }
 
@@ -210,6 +313,6 @@ function report(files, problems) {
   console.log(uniq.length ? `page problems (${uniq.length}):\n  ${uniq.slice(0, 15).join('\n  ')}` : 'page problems: none');
 }
 
-const run = { shot, video, term }[kind];
-if (!run) die('usage: proof shot|video|term … (see the header of this file: sed -n 2,25p "$(command -v proof)")');
+const run = { steps, shot, term, video }[kind];
+if (!run) die('usage: proof steps|shot|term|video … (see the header of this file: sed -n 2,30p "$(command -v proof)")');
 run().catch((e) => die(String(e.stack || e).slice(0, 600)));

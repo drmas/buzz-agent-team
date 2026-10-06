@@ -3,5 +3,13 @@
     "UserPromptSubmit": [
       { "hooks": [ { "type": "command", "command": "/opt/agent-tools/ambient-gate --hook", "timeout": 45 } ] }
     ]
+  },
+  "permissions": {
+    "deny": [
+      "mcp__plugin_vercel_vercel__buy_pro", "mcp__plugin_vercel_vercel__buy_credits",
+      "mcp__plugin_vercel_vercel__buy_addon", "mcp__plugin_vercel_vercel__buy_domain",
+      "mcp__vercel__buy_pro", "mcp__vercel__buy_credits", "mcp__vercel__buy_addon", "mcp__vercel__buy_domain",
+      "Bash(vercel domains buy:*)", "Bash(vc domains buy:*)"
+    ]
   }
 }

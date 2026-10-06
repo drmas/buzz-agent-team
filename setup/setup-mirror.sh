@@ -1,8 +1,8 @@
-# Runs on the instance: nightly memory mirror + handoff cleanup (systemd timer) + one immediate run.
+# Runs on the instance: nightly memory mirror + handoff and worktree cleanup (systemd timer) + one immediate run.
 set -euo pipefail
 cat > /etc/systemd/system/buzz-memory-mirror.service <<'UNIT'
 [Unit]
-Description=Mirror Buzz agents' file memory into their Buzz memory; prune old file handoffs
+Description=Mirror Buzz agents' file memory into their Buzz memory; prune old file handoffs and finished worktrees
 Requires=docker.service
 After=docker.service buzz-agents.service
 
@@ -11,6 +11,7 @@ Type=oneshot
 WorkingDirectory=/opt/buzz-agents
 ExecStart=/opt/buzz-agents/agentctl mirror
 ExecStart=/opt/buzz-agents/agentctl prune-exchange 30
+ExecStart=/opt/buzz-agents/agentctl prune-worktrees
 UNIT
 cat > /etc/systemd/system/buzz-memory-mirror.timer <<'UNIT'
 [Unit]

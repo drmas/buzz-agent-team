@@ -32,17 +32,22 @@ and the docs we use to run it. Fork it, fill in `setup/config.env`, and follow `
 - **Stack skills where they help.** Engineering agents get React, composition, Postgres and UI
   guideline skills from Vercel, Supabase and Anthropic, fetched at pinned commits; the Designer gets
   the design ones. `agentctl skills` changes who has what. The image includes headless Chromium for
-  e2e tests, plus Playwright and ffmpeg for recording proof.
+  e2e tests, plus Playwright and ffmpeg for capturing proof.
 - **Cheap ambient listening.** Before an agent's main model sees a channel message it wasn't
   mentioned in, `ambient-gate` asks a fast model whether the message is for it. Messages that
   clearly aren't cost nothing.
-- **Proof with every delivery.** An agent that reports finished work attaches a screenshot or a
-  short captioned video of the test it ran (`proof`: headless Chromium + Playwright + ffmpeg), so
-  you can check the work from the chat. No proof, not done.
+- **Proof with every delivery.** An agent that reports finished work attaches screenshots of the
+  test it ran (`proof`: headless Chromium + Playwright), for UI a captioned storyboard of every
+  step, so you can check the work from the chat. No proof, not done. Videos are opt-in: only when
+  motion matters or you ask, one at a time, since recording is memory-heavy.
 - **File handoffs between agents.** Workspaces are private, so agents hand files over with
   `handoff`: a read-only snapshot every agent can open at `/exchange/<agent>/…`, plus one Buzz
   message with real mentions and the file list (images also attached in Buzz). `attachments`
   downloads whatever a human attached to a message. Any file type; old handoffs are pruned nightly.
+- **Build and deploy web apps.** The Vercel CLI (team token from SSM) deploys previews, and
+  production only when a human asks. Claude agents get Vercel's plugin (skills, a
+  `deployment-expert` subagent, the Vercel MCP server for logs and deployments); Codex agents get
+  the MCP server. Purchase tools are blocked.
 - **Cheap long-term memory.** Plain files in `~/memory` behind a token-frugal `mem` command,
   mirrored nightly into Buzz so you can read them in Buzz Desktop.
 - **Team-editable instructions.** Anyone can tell an agent "from now on…" and it updates its own
@@ -82,11 +87,11 @@ Your laptop                            agentctl (manage agents), systemd units
 | `setup/config.example.env` | Every deployment-specific value; copy to `config.env` (git-ignored) |
 | `setup/provision.sh`, `user-data.sh` | Create the EC2 host, IAM role, security group, Elastic IP |
 | `setup/setup-agents.sh`, `boot-unit.sh` | Agent image, first agents, secrets refresh, start on boot |
-| `setup/agentctl` | Server-side CLI: add/remove agents, models, memory limits, skills, runtimes, prompts, listening, profiles, memory mirror, handoff cleanup |
+| `setup/agentctl` | Server-side CLI: add/remove agents, models, memory limits, skills, runtimes, prompts, listening, profiles, memory mirror, handoff cleanup, Vercel plugin |
 | `setup/deploy-team.sh` | Ship agentctl, prompts, skills, tools and Claude settings; create team agents; set default models; restart what changed |
-| `setup/prompts/` | Role prompts, team rules (`_team.md`), turn-taking (`_turns.md`), files (`_files.md`), proof of work (`_proof.md`), delegation (`_delegate.md`, `_delegate-codex.md`), people |
-| `setup/tools/` | `mem`, `mem-mirror`, `turn-gate`, `ambient-gate`, `handoff`, `attachments`, `proof` (on every agent's PATH) |
-| `setup/claude/` | Claude agents' managed settings (ambient-gate hook) and subagents (`explorer`, `researcher`, `planner`, `worker`, `reviewer`, `deep-work`) |
+| `setup/prompts/` | Role prompts, team rules (`_team.md`), reply style and Complexity 0–5 scale (`_replies.md`), worktrees (`_worktrees.md`), turn-taking (`_turns.md`), files (`_files.md`), proof of work (`_proof.md`), deploying (`_deploy.md`), delegation (`_delegate.md`, `_delegate-codex.md`), people |
+| `setup/tools/` | `mem`, `mem-mirror`, `turn-gate`, `ambient-gate`, `handoff`, `attachments`, `proof`, `wt` (on every agent's PATH) |
+| `setup/claude/` | Claude agents' managed settings (ambient-gate hook, blocked Vercel purchase tools) and subagents (`explorer`, `researcher`, `planner`, `worker`, `reviewer`, `deep-work`) |
 | `setup/codex/` | Codex agents' custom agents (the same roles, from drmas/codex-agent-team) |
 | `setup/skills/` | `memory`, `update-instructions` (every agent) |
 | `setup/skill-library.txt` | Opt-in third-party skills, pinned by commit; given per agent with `agentctl skills` |

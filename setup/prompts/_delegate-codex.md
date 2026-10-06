@@ -31,7 +31,7 @@ Each assignment is compact and self-contained: the role instructions, one bounde
 relevant context and paths, constraints, file ownership, acceptance criteria, and required
 validation. Keep delegation one level deep and tell children not to spawn agents. Parallelize
 independent read-only work; serialize dependencies and overlapping writes, with one writer per
-file set. Explorer, researcher, planner, and reviewer stay read-only.
+file set and one worktree per parallel writer (`wt new <repo> <task>-<part>`, path in the brief). Explorer, researcher, planner, and reviewer stay read-only.
 
 Keep requested and observed routing separate: judge the model and effort a child actually ran
 with from runtime metadata, not its own prose. Mention routing in Buzz only when it failed or

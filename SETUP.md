@@ -112,6 +112,15 @@ TypeSafe API key from https://console.typesafe.ai/keys, stored the same way:
 read -rsp "TypeSafe API key: " K && aws ssm put-parameter --region us-east-1 --name /buzz/typesafe-api-key --type SecureString --value "$K" --overwrite && unset K
 ```
 
+Optional, for deploying web apps to Vercel (see GUIDE.md, "Vercel"): an access token from
+https://vercel.com/account/tokens, scoped to the team the agents should deploy to and with an
+expiry you'll remember, plus that team's slug:
+
+```bash
+read -rsp "Vercel token: " K && aws ssm put-parameter --region us-east-1 --name /buzz/vercel-token --type SecureString --value "$K" --overwrite && unset K
+aws ssm put-parameter --region us-east-1 --name /buzz/vercel-team --type String --value <team-slug> --overwrite
+```
+
 ### 4. Install the management layer and the team agents
 
 Set `TEAM_NAME` and `OWNER_NAME` in `config.env` and fill in `prompts/_people.md` (company +
@@ -125,9 +134,11 @@ Installs `agentctl`, prompt sources, skills (`update-instructions`, `memory`), t
 `mem-mirror`, `turn-gate`, `ambient-gate`, `handoff`, `attachments`, `proof`), the Claude agents'
 managed settings and subagents and the Codex agents' custom agents; fetches the opt-in skills in
 `skill-library.txt` and gives agents without a skill list their defaults; adds headless Chromium,
-and ffmpeg + `playwright-core` for `proof`, to the image if missing; creates `pm`, `designer`, `marketing` and `engineer` (Claude
+ffmpeg + `playwright-core` for `proof`, and the Vercel CLI to the image if missing; creates `pm`, `designer`, `marketing` and `engineer` (Claude
 Code); sets each agent's default model and effort where none is set; builds each agent's
-instructions with the auto-generated "Who's who" roster; starts everything. It is idempotent:
+instructions with the auto-generated "Who's who" roster; starts everything; adds the Vercel
+plugin to Claude agents and the Vercel MCP server to Codex agents (`agentctl vercel`). Sign each
+agent in to Vercel afterwards: GUIDE.md, "Vercel: sign each agent in". It is idempotent:
 re-run it after editing any prompt, skill or tool.
 
 ### 5. Add the agents to the community
@@ -226,6 +237,7 @@ updates automatically.
 | **Renew the Claude token (valid 1 year; note the date in `DEPLOYMENT.local.md`)** | Step 3 again, then on the server `/opt/buzz-agents/refresh-secrets.sh` and `agentctl restart <id>` for each Claude agent |
 | Upgrade Claude Code / Codex / adapters / `playwright-core` | Edit the pinned versions in `/opt/buzz-agents/Dockerfile`, then `docker compose -p buzz-agents build && agentctl render && docker compose -p buzz-agents up -d`. Then check the model and effort still apply (`agentctl list`, first reply) and that `~/.ambient-gate.log` still gets entries: both rely on Claude Code settings and hooks behaving the same |
 | Change team rules, roles, roster people | Edit `setup/prompts/*`, run `./deploy-team.sh` (or edit `prompts/src/` on the server + `agentctl sync`) |
+| Renew or change the Vercel token | Step 3 again (`/buzz/vercel-token`, `/buzz/vercel-team`), then `./deploy-team.sh` (reloads secrets, recreates agents) |
 | Turn the turn-taking gate on/off | Store / delete `/buzz/typesafe-api-key`, then `./deploy-team.sh` (reloads secrets, recreates agents). Without the key, `ambient-gate` switches to Haiku |
 | Change an agent's model or effort | `agentctl model <id> <model> <effort>` (restarts it) |
 | Change an agent's skills | `agentctl skills <id> <skill…>\|none` (restarts it). Add or update a skill: edit `setup/skill-library.txt` (name, repo, commit, path), run `./deploy-team.sh` |
@@ -233,6 +245,7 @@ updates automatically.
 | Move an agent between Claude Code and Codex | `agentctl runtime <id> claude\|codex`, then `agentctl model …` (and `agentctl login-codex <id>` for Codex) |
 | Tune or turn off the ambient gate for one agent | `AMBIENT_GATE_MIN=<0–1>` or `AMBIENT_GATE=off` in `/opt/buzz-agents/<id>.env`, then `agentctl restart <id>` |
 | Clean up file handoffs now | `agentctl prune-exchange [days]` (nightly it keeps 30 days) |
+| Clean up git worktrees now | `agentctl prune-worktrees [id …] [--days N] [--dry-run]` (nightly with the defaults: idle pushed work after 14 days) |
 | Change listening channels | `agentctl listen <id> <channels…>` |
 | Change who an agent answers | `agentctl respond-to <id> owner-only\|anyone`, then republish its owner record with the same value |
 | Force a memory mirror | `agentctl mirror [id]` |
@@ -248,7 +261,7 @@ updates automatically.
 - The relay only accepts events signed by the authenticated key, so owner records must be published
   with your key (`publish-owner-records.py`). Cloudflare in front of the relay rejects Python's
   default user agent (HTTP 403 "error code: 1010"); the script sets its own.
-- **Only the owner can DM agents**, whatever `respond-to` says. Others must use channels.
+- **DMs:** agents with `respond-to anyone` accept DMs from anyone (the prompt no longer turns them away). If a non-owner still can't open a DM with an agent, that limit is on the Buzz side, not in this setup.
 - Workflow messages turn `@Name` into real mentions only for **channel members**; create workflows
   from an agent that is a member and is *not* the one being mentioned. Cron is **UTC**.
   `buzz workflows delete` was accepted but didn't remove workflows; disable with `update` instead.
@@ -313,7 +326,17 @@ updates automatically.
   snapshots files there and posts the message; `attachments` downloads a message's `imeta`
   attachments with `buzz media get`. The buzz CLI only uploads jpeg, png, gif, webp and mp4
   (checked by file content, max 50 MB, 500 MB for video), which is why documents go through
-  `/exchange`. The nightly mirror timer also runs `agentctl prune-exchange 30`.
+  `/exchange`. The nightly mirror timer also runs `agentctl prune-exchange 30` and `agentctl prune-worktrees`
+  (`wt gc` in each agent: see GUIDE.md, "Parallel code work: worktrees").
+- **Vercel:** deploys use the CLI with `VERCEL_TOKEN` (from `/buzz/vercel-token` via
+  `secrets/common.env`), which works headless. The Vercel MCP server (`https://mcp.vercel.com`)
+  accepts only OAuth from approved clients, so each agent is signed in once by hand; the redirect
+  goes to the container's `localhost`, which is why the sign-in ends with a `curl` from a second
+  shell. `npx plugins add vercel/vercel-plugin` installs `vercel@claude-plugins-official` on
+  Claude Code, which is what `agentctl vercel` does directly (no clone of the plugin repo); on
+  Codex 0.156 it fails (`vercel` isn't in `openai-curated`), so Codex agents get a
+  `[mcp_servers.vercel]` block with `disabled_tools` for the purchase tools. The MCP tools of the
+  plugin are `mcp__plugin_vercel_vercel__*`.
 - The Claude subscription is shared by every Claude agent, so the cheaper defaults (Sonnet for
   chat-heavy roles, the ambient gate, a Haiku `explorer` for lookups) also make its usage limits last longer.
 - `claude setup-token` run from a chat command box leaks the token's tail into the chat; run it in

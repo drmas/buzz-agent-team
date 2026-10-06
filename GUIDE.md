@@ -20,7 +20,7 @@ Buzz identity, storage and memory.
 Default models: Sonnet (medium effort) for PM, Designer and Marketing; Opus (medium) for `claude`
 and `engineer`; Codex's default model at medium reasoning for `codex`. See "Models and effort" below.
 
-All of them answer anyone in the community when mentioned. Only the owner can DM them.
+All of them answer anyone in the community, in channels and in DMs.
 When one message mentions several of them, they take turns (see "Taking turns" below). They pass
 files to each other with `handoff` (see "Files between agents").
 
@@ -90,9 +90,49 @@ Then restart the agent: `buzz-team restart <agent>`.
 
 - **npm packages work:** `npm install -g <package>` installs into the agent's storage and is on its
   PATH (the system folders are read-only by design).
-- **Sign-in limitation:** connectors whose OAuth sign-in redirects your browser to `localhost` may
-  not complete, because `localhost` there means the container, not your laptop. Connectors that
-  use an API key, a token, or a code you paste work fine.
+- **Sign-in:** connectors whose OAuth sign-in redirects your browser to `localhost` don't
+  complete on their own, because `localhost` there means the container, not your laptop. Finish
+  them from a second shell, as in "Vercel: sign each agent in" below. Connectors that use an API
+  key, a token, or a code you paste work directly.
+
+## Vercel: build and deploy web apps
+
+Every agent can deploy to Vercel:
+
+- **Vercel CLI** (`vercel`, in the image) for deploys. It uses the team token from
+  `/buzz/vercel-token` (and the team slug in `/buzz/vercel-team`); see SETUP.md step 3. Without
+  the token, agents say deploying isn't set up.
+- **Vercel plugin** on Claude agents (the one `npx plugins add vercel/vercel-plugin` installs,
+  from the official Claude plugin marketplace): Vercel skills (Next.js, AI SDK, env vars,
+  deployments…), subagents like `deployment-expert`, and the Vercel MCP server. Codex agents get
+  the Vercel MCP server alone (the plugin isn't in Codex's marketplace). `deploy-team.sh` installs
+  them with `agentctl vercel`; plugin telemetry is off (`VERCEL_PLUGIN_TELEMETRY=off`).
+- **Rules** (`prompts/_deploy.md`): preview deploys by default, production only when a human asks;
+  proof is a capture of the deployed URL. The MCP purchase tools (plans, credits, add-ons,
+  domains) are blocked: `permissions.deny` in `claude/managed-settings.json`, `disabled_tools` in
+  Codex's `~/.codex/config.toml`.
+
+### Vercel: sign each agent in
+
+The Vercel MCP server (build and runtime logs, deployments, project settings, docs, shareable
+links to protected previews) signs in with OAuth, once per agent. The agent gets the access of the
+Vercel account you approve with, so use one that can see only what the agents should touch.
+
+**Claude agents:**
+
+1. `buzz-team claude <agent>`, run `/mcp`, pick `plugin:vercel:vercel`, then **Authenticate**.
+2. Open the URL it shows in your laptop's browser and approve. The browser then fails to load a
+   `http://localhost:<port>/callback?code=…` page: copy that whole address.
+3. Keep Claude Code open. In a second terminal: `buzz-team shell <agent>`, then
+   `curl -s '<the address you copied>'`. Claude Code shows the server as connected. (If Claude
+   Code offers a box to paste the address into, that works too.)
+4. `/exit`, then `buzz-team restart <agent>`.
+
+**Codex agents:** `buzz-team shell <agent>`, run `codex mcp login vercel`, then steps 2-3 with
+the address it prints, and `buzz-team restart <agent>`.
+
+The sign-in is saved in the agent's home and renews itself. Check it with `claude mcp list`
+(`plugin:vercel:vercel … ✓ Connected`) or `codex mcp list`.
 
 ## Check the agent picked it up
 
@@ -231,13 +271,66 @@ handoff --channel <uuid> --reply-to <event> --to Engineer --file spec.md --file 
 When an agent reports that it built or fixed something, it attaches proof of the test it ran to
 that message (rule in `prompts/_proof.md`), so you can validate the work from the chat:
 
-- UI work: a short MP4 of the real flow, with a caption for each step, plus a screenshot of the
-  end state.
+- UI work: a storyboard image of the real flow (a captioned screenshot at the end of each step),
+  plus a screenshot of the end state.
 - Backend, API or CLI work: a screenshot of the test run or requests, output and exit code included.
 
-Agents make these with `proof` (`proof video|shot <url> [--script flow.mjs]`, `proof term -- <cmd>`),
+Agents make these with `proof` (`proof steps|shot <url> [--script flow.mjs]`, `proof term -- <cmd>`),
 which drives the container's headless Chromium. Captures stay in the agent's `/workspace/proof/`.
 If a report comes without proof, ask for it: the agents are told to treat that as not done.
+
+Video is not required. Recording (`proof video`) takes much more memory than screenshots and was
+running agents out of memory, so agents record only when screenshots can't show the point
+(animations, drag and drop, live updates, a timing bug) or when you ask for a video. The tool runs
+one video at a time per container (a second one waits), refuses to start with less than 800 MB
+free (`PROOF_VIDEO_MIN_FREE_MB`), keeps frames on disk and stops at 60 s. Want a video? Ask for
+it in the thread.
+
+## Parallel code work: worktrees
+
+An agent can work on several requests at once, and its workers run in parallel. To keep them from
+overwriting each other, every code change happens in its own git worktree, made with `wt` (rule in
+`prompts/_worktrees.md`, tool in `tools/wt`):
+
+- `/workspace/repos/<repo>` is one base clone per repo, never edited.
+- `/workspace/wt/<repo>/<task>` is one worktree per task, on branch `<agent-id>/<task>`, so
+  branches from different agents never collide on GitHub. `wt new` also lists other agents'
+  recent branches on that repo so they can coordinate before touching the same area.
+
+Cleanup, so the disk doesn't fill up:
+
+| When | What happens |
+|---|---|
+| Task finished (PR merged or closed, or the person says so) | The agent runs `wt done <repo>/<task>` |
+| Nightly, `wt gc` in every agent | Removes worktrees that are merged or whose branch was deleted on GitHub, and pushed ones idle 14 days (`wt new` brings them back) |
+| Idle 3 days | Deletes git-ignored `node_modules`, `.next`, `dist`, … inside the worktree; the code stays |
+| Base clone unused 60 days | Removed when it has nothing that isn't on the remote |
+
+Nothing with uncommitted or unpushed changes is ever removed automatically: `wt gc` lists it as
+STALE and the agent pushes it or asks. Check an agent with `buzz-team shell <agent>`, then
+`wt ls`; clean up by hand with `agentctl prune-worktrees <agent> --dry-run` (drop `--dry-run` to
+apply).
+
+## Short replies and the Complexity scale
+
+Every agent follows the same reply rules (`prompts/_replies.md`): answer first, a few plain lines,
+details in a file or note, and an image (diagram, mockup, screenshot) when it explains faster
+than text. Diagrams are small HTML pages rendered to PNG with `proof shot`.
+
+When an agent proposes, estimates or reports a change, it rates it on one shared scale and names
+what it touches:
+
+```
+Complexity: 3/5 (Medium): new settings page on the existing API
+Touches: settings page, preferences API, users table
+```
+
+| 0 None | 1 Trivial | 2 Small | 3 Medium | 4 Large | 5 Major |
+|---|---|---|---|---|---|
+| answer or review only | one small edit, minutes | one part, hours | 2–3 parts or a new feature, days | many parts, data/API changes, a week+ | new system or risky/irreversible; needs a human decision |
+
+At 3 or higher the agent also attaches an impact diagram with the touched parts highlighted. To
+change the scale, edit `prompts/_replies.md` and redeploy; every agent picks up the same version.
 
 ## Ambient gate: fewer wasted turns
 
@@ -272,6 +365,7 @@ through; default 0.3) or `AMBIENT_GATE=off` to `/opt/buzz-agents/<agent>.env` on
 | `agentctl sync` | Rebuild instructions and roster, restart changed agents |
 | `agentctl mirror` | Copy memory into Buzz now (it also runs nightly at 02:00 UTC) |
 | `agentctl prune-exchange [days]` | Delete file handoffs older than N days (default 30; also nightly) |
+| `agentctl prune-worktrees [agent …] [--days N] [--dry-run]` | Remove finished and idle git worktrees (also nightly) |
 
 The people/company section of the roster is `/opt/buzz-agents/prompts/src/_people.md`; after
 editing it, run `agentctl sync`. (Better: edit `setup/prompts/_people.md` and run
@@ -283,10 +377,12 @@ editing it, run `agentctl sync`. (Better: edit `setup/prompts/_people.md` and ru
 |---|---|
 | `Your session has expired` | `aws login` |
 | `SessionManagerPlugin is not found` | `yay -S aws-session-manager-plugin` |
-| Agent reports work without a screenshot or video | Ask for proof in the thread. If it says `proof` failed, check it in the container: `buzz-team shell engineer`, then `proof term -- echo ok` |
+| Agent reports work without screenshots | Ask for proof in the thread. If it says `proof` failed, check it in the container: `buzz-team shell engineer`, then `proof term -- echo ok`. If `proof video` says too little memory is free, ask for `proof steps` screenshots instead |
 | Agent didn't answer a DM or a mention of only it | Check `~/.turn-gate.log` and `~/.ambient-gate.log` for that event; both should say `REPLY`. Resend with a real mention (picked from the list, not typed) |
 | `permission denied … docker.sock` in a server shell | You're `ssm-user`; run `sudo -i` first |
 | Agent doesn't use a new plugin or MCP server | `buzz-team restart <agent>`, then check `buzz-team logs <agent>` |
+| Agent says deploying isn't set up | `/buzz/vercel-token` is missing or wasn't loaded: store it (SETUP.md step 3), run `./deploy-team.sh` |
+| Agent says its Vercel sign-in is missing | Sign it in: "Vercel: sign each agent in" |
 | Agent doesn't reply | Check it's a member of the channel and `buzz-team logs <agent>` |
 | Agents still answer on top of each other | Check `~/.turn-gate.log` in each: `gate off (no TYPESAFE_API_KEY)` means the key isn't loaded (`./deploy-team.sh`) |
 | Second agent is too slow | Lower `STEP` / `MAX_WAIT` at the top of `setup/tools/turn-gate`, then `./deploy-team.sh` |

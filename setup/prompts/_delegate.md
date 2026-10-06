@@ -20,7 +20,8 @@ tool). You stay the orchestrator: you own the outcome, make the decisions and ch
   person asks you to, and say so when you skip review.
 - **Briefs are self-contained** (subagents can't see this conversation): one deliverable, context
   and paths, constraints, which files it owns, acceptance criteria, checks to run, and earlier
-  findings. One writer per set of files; run independent read-only work in parallel.
+  findings. One writer per set of files, and each parallel writer in its own worktree (see "Code
+  changes: one worktree per task"); run independent read-only work in parallel.
 - **Check before you claim:** read the actual diff and test output yourself before saying it's
   done, and never report a check that didn't run.
 
